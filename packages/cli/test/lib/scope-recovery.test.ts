@@ -1,0 +1,469 @@
+import { describe, expect, test, vi } from "vitest";
+import { ApiError, AuthError } from "../../src/lib/errors.js";
+import { OAUTH_SCOPES } from "../../src/lib/oauth.js";
+import {
+  ensureCurrentOAuthScopes,
+  ensureScopesForAction,
+  runWithScopeRecovery,
+  type ScopeRecoveryRuntime,
+} from "../../src/lib/scope-recovery.js";
+
+function runtime(
+  overrides: Partial<ScopeRecoveryRuntime> = {},
+): ScopeRecoveryRuntime {
+  return {
+    assertTrustedHost: vi.fn(),
+    getAuthScopes: vi.fn().mockResolvedValue(OAUTH_SCOPES),
+    getAuthSource: () => "oauth",
+    inputIsTty: () => true,
+    promptsAllowed: () => true,
+    write: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe("runWithScopeRecovery", () => {
+  test("checks the token after a 403, re-authorizes a stale grant, and retries", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const proceed = vi
+      .fn<(argv: string[]) => Promise<void>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce();
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+    const testRuntime = runtime({
+      getAuthScopes: vi
+        .fn()
+        .mockResolvedValue(
+          OAUTH_SCOPES.filter((scope) => scope !== "team:admin"),
+        ),
+    });
+
+    await runWithScopeRecovery(
+      proceed,
+      ["project", "create"],
+      login,
+      testRuntime,
+    );
+
+    expect(proceed).toHaveBeenCalledTimes(2);
+    expect(testRuntime.getAuthScopes).toHaveBeenCalledOnce();
+    expect(testRuntime.assertTrustedHost).toHaveBeenCalledOnce();
+    expect(login).toHaveBeenCalledWith();
+    expect(testRuntime.write).toHaveBeenCalledWith(
+      expect.stringContaining("team:admin"),
+    );
+  });
+
+  test("re-authorizes the account picked for the target org, not the active one", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const proceed = vi
+      .fn<(argv: string[]) => Promise<void>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce();
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await runWithScopeRecovery(
+      proceed,
+      [],
+      login,
+      runtime({
+        getAuthScopes: vi.fn().mockResolvedValue([]),
+        getReauthorizationAccountId: () => "work-account",
+      }),
+    );
+
+    expect(login).toHaveBeenCalledWith({ accountId: "work-account" });
+    expect(proceed).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not re-authorize a role or policy 403 when the token has every scope", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const proceed = vi.fn().mockRejectedValue(error);
+    const login = vi.fn();
+
+    await expect(
+      runWithScopeRecovery(proceed, [], login, runtime()),
+    ).rejects.toBe(error);
+
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("re-authorizes after a 401 when the API reports no active token", async () => {
+    const error = new ApiError("Unauthorized", 401);
+    const proceed = vi
+      .fn<(argv: string[]) => Promise<void>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce();
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await runWithScopeRecovery(
+      proceed,
+      [],
+      login,
+      runtime({ getAuthScopes: vi.fn().mockResolvedValue(null) }),
+    );
+
+    expect(login).toHaveBeenCalledOnce();
+    expect(proceed).toHaveBeenCalledTimes(2);
+  });
+
+  test("re-authorizes when scope inspection rejects an invalid token", async () => {
+    const error = new ApiError("Unauthorized", 401);
+    const proceed = vi
+      .fn<(argv: string[]) => Promise<void>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce();
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await runWithScopeRecovery(
+      proceed,
+      [],
+      login,
+      runtime({
+        getAuthScopes: vi
+          .fn()
+          .mockRejectedValue(new ApiError("Invalid token", 401)),
+      }),
+    );
+
+    expect(login).toHaveBeenCalledOnce();
+    expect(proceed).toHaveBeenCalledTimes(2);
+  });
+
+  test("re-authorizes when a failed refresh clears the stored OAuth row", async () => {
+    const error = new ApiError("Unauthorized", 401);
+    const proceed = vi
+      .fn<(argv: string[]) => Promise<void>>()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce();
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+    const getAuthSource = vi
+      .fn<() => "oauth" | undefined>()
+      .mockReturnValueOnce("oauth")
+      .mockReturnValueOnce(undefined);
+    const getAuthScopes = vi.fn();
+
+    await runWithScopeRecovery(
+      proceed,
+      [],
+      login,
+      runtime({ getAuthSource, getAuthScopes }),
+    );
+
+    expect(login).toHaveBeenCalledOnce();
+    expect(getAuthScopes).not.toHaveBeenCalled();
+  });
+
+  test("does not launch OAuth for environment tokens", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const login = vi.fn();
+    const getAuthScopes = vi.fn().mockResolvedValue([]);
+
+    await expect(
+      runWithScopeRecovery(
+        vi.fn().mockRejectedValue(error),
+        [],
+        login,
+        runtime({
+          getAuthSource: () => "env:SENTRY_AUTH_TOKEN",
+          getAuthScopes,
+        }),
+      ),
+    ).rejects.toBe(error);
+
+    expect(login).not.toHaveBeenCalled();
+    expect(getAuthScopes).not.toHaveBeenCalled();
+  });
+
+  test("checks scopes but does not launch OAuth without an interactive TTY", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const getAuthScopes = vi.fn().mockResolvedValue([]);
+    const login = vi.fn();
+
+    await expect(
+      runWithScopeRecovery(
+        vi.fn().mockRejectedValue(error),
+        [],
+        login,
+        runtime({ getAuthScopes, inputIsTty: () => false }),
+      ),
+    ).rejects.toBe(error);
+
+    expect(getAuthScopes).toHaveBeenCalledOnce();
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("does not launch OAuth when JSON output disables prompts", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const getAuthScopes = vi.fn().mockResolvedValue([]);
+    const login = vi.fn();
+
+    await expect(
+      runWithScopeRecovery(
+        vi.fn().mockRejectedValue(error),
+        ["--json"],
+        login,
+        runtime({ getAuthScopes, promptsAllowed: () => false }),
+      ),
+    ).rejects.toBe(error);
+
+    expect(getAuthScopes).toHaveBeenCalledOnce();
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("preserves the original error when scope inspection fails", async () => {
+    const error = new ApiError("Forbidden", 403);
+    const login = vi.fn();
+
+    await expect(
+      runWithScopeRecovery(
+        vi.fn().mockRejectedValue(error),
+        [],
+        login,
+        runtime({
+          getAuthScopes: vi.fn().mockRejectedValue(new Error("offline")),
+        }),
+      ),
+    ).rejects.toBe(error);
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("does not attempt a second recovery when the retry fails", async () => {
+    const first = new ApiError("Forbidden", 403);
+    const second = new ApiError("Still forbidden", 403);
+    const proceed = vi
+      .fn<(argv: string[]) => Promise<void>>()
+      .mockRejectedValueOnce(first)
+      .mockRejectedValueOnce(second);
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await expect(
+      runWithScopeRecovery(
+        proceed,
+        [],
+        login,
+        runtime({ getAuthScopes: vi.fn().mockResolvedValue([]) }),
+      ),
+    ).rejects.toBe(second);
+    expect(login).toHaveBeenCalledOnce();
+    expect(proceed).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("upgrade scope check", () => {
+  test("re-authorizes a stale OAuth grant", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+    const refreshed = await ensureCurrentOAuthScopes(
+      login,
+      runtime({ getAuthScopes: vi.fn().mockResolvedValue(["org:read"]) }),
+    );
+
+    expect(refreshed).toBe(true);
+    expect(login).toHaveBeenCalledOnce();
+  });
+
+  test("re-authorizes when the stored token is rejected during upgrade", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+    const refreshed = await ensureCurrentOAuthScopes(
+      login,
+      runtime({
+        getAuthScopes: vi
+          .fn()
+          .mockRejectedValue(new ApiError("Invalid token", 401)),
+      }),
+    );
+
+    expect(refreshed).toBe(true);
+    expect(login).toHaveBeenCalledOnce();
+  });
+
+  test("re-authorizes when upgrade scope inspection reports expired auth", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+    const refreshed = await ensureCurrentOAuthScopes(
+      login,
+      runtime({
+        getAuthScopes: vi.fn().mockRejectedValue(new AuthError("expired")),
+      }),
+    );
+
+    expect(refreshed).toBe(true);
+    expect(login).toHaveBeenCalledOnce();
+  });
+
+  test("does nothing when the stored grant is current", async () => {
+    const login = vi.fn();
+    expect(await ensureCurrentOAuthScopes(login, runtime())).toBe(false);
+    expect(login).not.toHaveBeenCalled();
+  });
+});
+
+describe("ensureScopesForAction", () => {
+  const withoutIntegrations = OAUTH_SCOPES.filter(
+    (scope) => scope !== "org:integrations",
+  );
+
+  test("returns ready without prompting when the grant has the scopes", async () => {
+    const login = vi.fn();
+    const testRuntime = runtime();
+
+    await expect(
+      ensureScopesForAction(
+        ["org:integrations"],
+        "Removing an integration",
+        login,
+        testRuntime,
+      ),
+    ).resolves.toBe("ready");
+    expect(login).not.toHaveBeenCalled();
+    expect(testRuntime.write).not.toHaveBeenCalled();
+  });
+
+  test("re-authorizes a grant missing the scope and says why", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+    const testRuntime = runtime({
+      getAuthScopes: vi.fn().mockResolvedValue(withoutIntegrations),
+    });
+
+    await expect(
+      ensureScopesForAction(
+        ["org:integrations"],
+        "Removing an integration",
+        login,
+        testRuntime,
+      ),
+    ).resolves.toBe("elevated");
+    expect(testRuntime.assertTrustedHost).toHaveBeenCalledOnce();
+    expect(login).toHaveBeenCalledOnce();
+    expect(testRuntime.write).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Removing an integration needs elevated permissions (org:integrations)",
+      ),
+    );
+  });
+
+  test("elevates the account picked for the target org", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await expect(
+      ensureScopesForAction(
+        ["org:integrations"],
+        "Removing an integration",
+        login,
+        runtime({
+          getAuthScopes: vi.fn().mockResolvedValue(withoutIntegrations),
+          getReauthorizationAccountId: () => "work-account",
+        }),
+      ),
+    ).resolves.toBe("elevated");
+    expect(login).toHaveBeenCalledWith({ accountId: "work-account" });
+  });
+
+  test("reports declined when the login does not complete", async () => {
+    const testRuntime = runtime({
+      getAuthScopes: vi.fn().mockResolvedValue(withoutIntegrations),
+    });
+
+    await expect(
+      ensureScopesForAction(
+        ["org:integrations"],
+        "Removing an integration",
+        vi.fn().mockResolvedValue(null),
+        testRuntime,
+      ),
+    ).resolves.toBe("declined");
+  });
+
+  test("does not prompt without a TTY", async () => {
+    const login = vi.fn();
+    const testRuntime = runtime({
+      getAuthScopes: vi.fn().mockResolvedValue(withoutIntegrations),
+      inputIsTty: () => false,
+    });
+
+    await expect(
+      ensureScopesForAction(["org:integrations"], "x", login, testRuntime),
+    ).resolves.toBe("unavailable");
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("does not start the device flow when prompts are disabled (--yes/--json)", async () => {
+    const login = vi.fn();
+    const testRuntime = runtime({
+      getAuthScopes: vi.fn().mockResolvedValue(withoutIntegrations),
+      promptsAllowed: () => false,
+    });
+
+    await expect(
+      ensureScopesForAction(["org:integrations"], "x", login, testRuntime),
+    ).resolves.toBe("unavailable");
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("leaves env and auth tokens to the API", async () => {
+    const login = vi.fn();
+    const testRuntime = runtime({
+      getAuthSource: () => "env:SENTRY_AUTH_TOKEN",
+    });
+
+    await expect(
+      ensureScopesForAction(["org:integrations"], "x", login, testRuntime),
+    ).resolves.toBe("ready");
+    expect(testRuntime.getAuthScopes).not.toHaveBeenCalled();
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  test("requests opt-in scopes on top of the defaults", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await expect(
+      ensureScopesForAction(
+        ["org:tokens", "org:read"],
+        "Listing org auth tokens",
+        login,
+        runtime(),
+      ),
+    ).resolves.toBe("elevated");
+    const requested = login.mock.calls[0]?.[0]?.scope?.split(" ");
+    expect(requested).toEqual([...OAUTH_SCOPES, "org:tokens"]);
+  });
+
+  test("keeps opt-in scopes the grant already holds", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await ensureScopesForAction(
+      ["org:tokens"],
+      "x",
+      login,
+      runtime({
+        getAuthScopes: vi
+          .fn()
+          .mockResolvedValue([...OAUTH_SCOPES, "org:admin", "not-a-scope"]),
+        getReauthorizationAccountId: () => "work-account",
+      }),
+    );
+    const options = login.mock.calls[0]?.[0];
+    expect(options?.accountId).toBe("work-account");
+    const requested = options?.scope?.split(" ");
+    expect(requested).toContain("org:admin");
+    expect(requested).toContain("org:tokens");
+    expect(requested).not.toContain("not-a-scope");
+  });
+
+  test("requests the defaults when only default scopes are missing", async () => {
+    const login = vi.fn().mockResolvedValue({ method: "oauth" });
+
+    await ensureScopesForAction(
+      ["org:integrations"],
+      "x",
+      login,
+      runtime({
+        getAuthScopes: vi
+          .fn()
+          .mockResolvedValue(
+            OAUTH_SCOPES.filter((scope) => scope !== "org:integrations"),
+          ),
+      }),
+    );
+    expect(login).toHaveBeenCalledWith();
+  });
+});

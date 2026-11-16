@@ -1,6 +1,4 @@
-import { setTag } from "@sentry/core";
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
@@ -9,6 +7,7 @@ import {
   ParamProjectSlug,
   ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { assertProjectRefWithinConstraint } from "./support/project-constraints";
 import {
@@ -18,6 +17,7 @@ import {
   ParamUptimeMonitorStatus,
   ParamUptimeOwner,
   ParamUptimeTimeoutMs,
+  toUptimeHeaderPairs,
   toUptimeMonitorSummary,
   uptimeMonitorSummarySchema,
 } from "./support/uptime-monitors";
@@ -28,6 +28,7 @@ export const createUptimeMonitorOutputSchema = z.object({
 
 export default defineTool({
   name: "create_uptime_monitor",
+  title: "Create Uptime Monitor",
   skills: ["project-management"],
   requiredScopes: ["project:write"],
   description: [
@@ -52,7 +53,11 @@ export default defineTool({
     regionUrl: ParamRegionUrl.nullable().default(null),
     projectSlug: ParamProjectSlug,
     name: z.string().trim().min(1).max(128).describe("Monitor display name."),
-    url: z.string().url().describe("URL to check."),
+    url: z
+      .string()
+      .url()
+      .max(255)
+      .describe("URL to check (max 255 characters)."),
     intervalSeconds: ParamUptimeIntervalSeconds,
     timeoutMs: ParamUptimeTimeoutMs.default(5000),
     method: ParamUptimeHttpMethod.optional(),
@@ -102,8 +107,7 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
-    setOrganizationContext(organizationSlug);
-    setTag("project.slug", params.projectSlug);
+    setTargetTagsAndAttributes(params);
 
     assertProjectRefWithinConstraint({
       resourceLabel: "Uptime monitor",
@@ -119,7 +123,7 @@ export default defineTool({
       intervalSeconds: params.intervalSeconds,
       timeoutMs: params.timeoutMs,
       method: params.method,
-      headers: params.headers,
+      headers: params.headers && toUptimeHeaderPairs(params.headers),
       body: params.body,
       status: params.status,
       owner: params.owner,

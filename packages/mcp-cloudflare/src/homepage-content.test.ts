@@ -16,6 +16,8 @@ describe("homepage-content", () => {
       expect(text).toContain("{projectSlug}");
       expect(text).toContain("claude mcp add");
       expect(text).toContain("?experimental=1");
+      expect(text).toContain("claude mcp add sentry -- sentry mcp");
+      expect(text).toContain("sentry mcp my-org/my-project");
     });
   });
 
@@ -38,7 +40,9 @@ describe("homepage-content", () => {
     });
 
     it("escapes HTML in generated content", () => {
-      const html = generateHomepageFallbackHtml('https://example.com/"onload="');
+      const html = generateHomepageFallbackHtml(
+        'https://example.com/"onload="',
+      );
       expect(html).toContain("&quot;");
       expect(html).not.toContain('onload="');
     });

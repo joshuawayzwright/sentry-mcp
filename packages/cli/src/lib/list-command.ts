@@ -1,0 +1,735 @@
+/**
+ * Shared building blocks for org-scoped list commands.
+ *
+ * Provides reusable Stricli parameter definitions (target positional, common
+ * flags, aliases) and a `buildOrgListCommand` factory for commands whose
+ * entire `func` body is handled by `dispatchOrgScopedList`.
+ *
+ * Level A — shared constants (used by all four list commands):
+ *   LIST_TARGET_POSITIONAL, LIST_JSON_FLAG, LIST_CURSOR_FLAG,
+ *   buildListLimitFlag, LIST_BASE_ALIASES
+ *
+ * Level B — full command builder (team / repo only):
+ *   buildOrgListCommand
+ */
+
+import type { Aliases, Command, CommandContext } from "@stricli/core";
+import type { GenericSchema } from "valibot";
+import type { SentryContext } from "../context.js";
+import { sentry } from "./app-identity.js";
+import { type ListTargetOptions, parseCursorFlag } from "./arg-parsing.js";
+import {
+  buildCommand,
+  type CommandDocumentation,
+  numberParser,
+  type SentryCommandFunction,
+} from "./command.js";
+import { ORG_PROJECT_TARGET, ORG_TARGET } from "./completion-target.js";
+import { disableOrgCache } from "./db/regions.js";
+import { disableDsnCache } from "./dsn/index.js";
+import { warning } from "./formatters/colors.js";
+import { CommandOutput, type OutputConfig } from "./formatters/output.js";
+import {
+  dispatchOrgScopedList,
+  jsonTransformListResult,
+  type ListResult,
+  type OrgListConfig,
+} from "./org-list.js";
+import {
+  applyBoundPositionals,
+  rawPositional,
+  skipLeadingArgument,
+  skippedArgument,
+} from "./positional-parse.js";
+import { disableResponseCache } from "./response-cache.js";
+import { type CliRoutes, findRoutes } from "./route-registry.js";
+import { type ListCommandTarget, listTarget } from "./target-positional.js";
+import { PERIOD_BRIEF, parsePeriod } from "./time-range.js";
+import { shellQuote } from "./utils.js";
+
+// ---------------------------------------------------------------------------
+// Level A: shared parameter / flag definitions
+// ---------------------------------------------------------------------------
+
+/**
+ * Absolute maximum items a list command will return.
+ *
+ * The Sentry API max `per_page` is 100 (some endpoints 400 if larger);
+ * commands auto-paginate to fill larger limits but stop at this ceiling
+ * for practical CLI use.
+ */
+export const LIST_MAX_LIMIT = 1000;
+
+/** Minimum allowed value for `--limit` across all list commands. */
+export const LIST_MIN_LIMIT = 1;
+
+/** Default number of items returned by list commands when `--limit` is omitted. */
+export const LIST_DEFAULT_LIMIT = 25;
+
+/**
+ * Accepted forms of an `[<org>/][<project>]` target that supports org-all
+ * mode. Positional briefs render in `--help`, the generated command docs, and
+ * the skill references, so the target syntax is described here once instead
+ * of in each command's `fullDescription`.
+ */
+export const ORG_ALL_TARGET_BRIEF =
+  "<org>/ (all projects), <org>/<project>, or <project> (search)";
+
+/**
+ * {@link ORG_ALL_TARGET_BRIEF} for list commands that also match names
+ * (see {@link parseListTargetInput}): a glob filters names, and a name that
+ * is no project matches names instead.
+ */
+export const NAMED_LIST_TARGET_BRIEF =
+  "<org>/ (all), <org>/<name> or <name> (a project, else matching names), or a name glob (<org>/web-*)";
+
+/** Accepted forms of a target that names one project (no org-all mode). */
+export const PROJECT_TARGET_BRIEF = "<org>/<project> or <project> (search)";
+
+/**
+ * Positional `org/project` parameter of a list command, parsed with
+ * {@link listTarget}: `func` gets a `ListCommandTarget` and passes
+ * `(await target.resolved)` to `dispatchOrgScopedList`.
+ *
+ * Accepts `<org>/`, `<org>/<project>`, or bare `<project>` (search).
+ * Marked optional so the command falls back to auto-detection when omitted.
+ *
+ * @param options.orgScoped - For org-scoped resources (teams, repos,
+ *   releases, …): shell completion suggests org slugs only
+ * @param options.names - A glob filters names, and a name that is no
+ *   project matches names instead
+ */
+export function listTargetPositional(
+  options: ListTargetOptions & { readonly orgScoped?: boolean } = {},
+) {
+  const { orgScoped, ...parseOptions } = options;
+  return {
+    kind: "tuple" as const,
+    parameters: [
+      {
+        placeholder: "org/project",
+        brief: parseOptions.names
+          ? NAMED_LIST_TARGET_BRIEF
+          : ORG_ALL_TARGET_BRIEF,
+        parse: listTarget(
+          orgScoped ? ORG_TARGET : ORG_PROJECT_TARGET,
+          parseOptions,
+        ),
+        optional: true as const,
+      },
+    ],
+  };
+}
+
+/** {@link listTargetPositional} for most list commands. */
+export const LIST_TARGET_POSITIONAL = listTargetPositional();
+
+/** {@link listTargetPositional} for org-scoped resources. */
+export const LIST_ORG_TARGET_POSITIONAL = listTargetPositional({
+  orgScoped: true,
+});
+
+/** {@link listTargetPositional} for org-scoped resources matched by name. */
+export const NAMED_LIST_ORG_TARGET_POSITIONAL = listTargetPositional({
+  orgScoped: true,
+  names: true,
+});
+
+/**
+ * Short note for commands that accept a bare project name but do not support
+ * org-all mode (e.g. trace list, log list, project view).
+ *
+ * Explains that a bare name triggers project-search, not org-scoped listing.
+ */
+export const TARGET_PATTERN_NOTE =
+  "A bare name (no slash) is treated as a project search. " +
+  "Use <org>/<project> for an explicit target.";
+
+/**
+ * Full explanation of trailing-slash semantics for commands that support all
+ * four target modes including org-all (e.g. issue list, project list).
+ *
+ * @param cursorNote - Optional sentence appended when the command supports
+ *   cursor pagination (e.g. "Cursor pagination (--cursor) requires the <org>/ form.").
+ */
+export function targetPatternExplanation(cursorNote?: string): string {
+  const base =
+    "The trailing slash on <org>/ is significant — without it, the argument " +
+    "is treated as a project name search (e.g., 'sentry' searches for a " +
+    "project named 'sentry', while 'sentry/' lists all projects in the " +
+    "'sentry' org).";
+  return cursorNote ? `${base} ${cursorNote}` : base;
+}
+
+/**
+ * The `--json` flag shared by all list commands.
+ * Outputs machine-readable JSON instead of a human-readable table.
+ *
+ * @deprecated Use `output: { human: ... }` on `buildCommand` instead, which
+ * injects `--json` and `--fields` automatically. This constant is kept
+ * for commands that define `--json` with custom brief text.
+ */
+export const LIST_JSON_FLAG = {
+  kind: "boolean" as const,
+  brief: "Output JSON",
+  default: false,
+} as const;
+
+/**
+ * The `--fresh` / `-f` flag shared by read-only commands.
+ * Bypasses the response cache and fetches fresh data from the API.
+ *
+ * Add to any command's `flags` object, then call `applyFreshFlag(flags)` at
+ * the top of `func()` to activate cache bypass when the flag is set.
+ *
+ * @example
+ * ```ts
+ * import { applyFreshFlag, FRESH_ALIASES, FRESH_FLAG } from "../lib/list-command.js";
+ *
+ * // In parameters:
+ * flags: { ..., fresh: FRESH_FLAG },
+ * aliases: { ...FRESH_ALIASES },
+ *
+ * // In func():
+ * applyFreshFlag(flags);
+ * ```
+ */
+export const FRESH_FLAG = {
+  kind: "boolean" as const,
+  brief: "Bypass cache, re-detect projects, and fetch fresh data",
+  default: false,
+} as const;
+
+/**
+ * Alias map for the `--fresh` flag: `-f` → `--fresh`.
+ *
+ * Spread into a command's `aliases` alongside other aliases:
+ * ```ts
+ * aliases: { ...FRESH_ALIASES, w: "web" }
+ * ```
+ *
+ * **Note**: Commands that use `-f` for a different flag (e.g. `log list`
+ * uses `-f` for `--follow`) should NOT spread this constant.
+ */
+export const FRESH_ALIASES = { f: "fresh" } as const;
+
+/**
+ * Apply the `--fresh` flag: disables the response cache for this invocation.
+ *
+ * Call at the top of a command's `func()` after defining the `fresh` flag:
+ * ```ts
+ * flags: { fresh: FRESH_FLAG },
+ * async *func(this: SentryContext, flags) {
+ *   applyFreshFlag(flags);
+ * ```
+ */
+export function applyFreshFlag(flags: { readonly fresh: boolean }): void {
+  if (flags.fresh) {
+    disableResponseCache();
+    disableDsnCache();
+    disableOrgCache();
+  }
+}
+
+/**
+ * The `--cursor` / `-c` flag shared by all list commands.
+ *
+ * Accepts navigation keywords (`next`, `prev`, `first`, `last`) or an
+ * opaque cursor string for power users. Only meaningful in `<org>/`
+ * (org-all) mode by default.
+ */
+export const LIST_CURSOR_FLAG = {
+  kind: "parsed" as const,
+  parse: parseCursorFlag,
+  brief: 'Navigate pages: "next", "prev", "first" (or raw cursor string)',
+  optional: true as const,
+};
+
+/**
+ * Build a bidirectional pagination hint string from next/prev command hints.
+ *
+ * Combines a "Prev" and/or "Next" hint into a single line, returning an
+ * empty string when neither direction is available. Commands supply their
+ * own fully-formed hint strings (including flag suffixes) via `nextHint`
+ * and `prevHint`.
+ *
+ * @param opts - Pagination state and pre-built hint strings
+ * @returns Combined hint string, or `""` if no navigation is possible
+ *
+ * @example
+ * ```ts
+ * const nav = paginationHint({
+ *   hasPrev: true,
+ *   hasMore: true,
+ *   prevHint: "sentry trace list my-org/my-proj -c prev",
+ *   nextHint: "sentry trace list my-org/my-proj -c next",
+ * });
+ * // → "Prev: sentry trace list my-org/my-proj -c prev | Next: sentry trace list my-org/my-proj -c next"
+ * ```
+ */
+export function paginationHint(opts: {
+  hasPrev: boolean;
+  hasMore: boolean;
+  prevHint: string;
+  nextHint: string;
+}): string {
+  const parts: string[] = [];
+  if (opts.hasPrev) {
+    parts.push(`Prev: ${opts.prevHint}`);
+  }
+  if (opts.hasMore) {
+    parts.push(`Next: ${opts.nextHint}`);
+  }
+  return parts.join(" | ");
+}
+
+/**
+ * Append a shell-quoted `--query` argument when the user passed `--query`.
+ *
+ * Preserve the exact query, including quotes and shell metacharacters, so copied
+ * pagination hints resolve the cursor stored for the original search. The inline
+ * flag value also keeps quoted segments in one argument in PowerShell.
+ */
+export function appendQueryHint(
+  parts: string[],
+  query: string | undefined,
+): void {
+  if (query) {
+    parts.push(`--query=${shellQuote(query)}`);
+  }
+}
+
+/**
+ * Append `--sort <value>` to a hint-flag parts array when the sort differs
+ * from the command's default.
+ *
+ * Stringly-typed to support both raw API sort strings (e.g. `"-count()"`)
+ * and command-specific enum values (e.g. `"date" | "duration"`).
+ */
+export function appendSortHint(
+  parts: string[],
+  sort: string | undefined,
+  defaultSort?: string,
+): void {
+  if (sort && sort !== defaultSort) {
+    parts.push(`--sort "${sort}"`);
+  }
+}
+
+/**
+ * Build the `--limit` / `-n` flag for a list command.
+ *
+ * @param entityPlural - Plural entity name used in the brief (e.g. "teams")
+ * @param defaultValue - Default limit as a string — Stricli passes it through
+ *   numberParser at runtime, so the command receives a number
+ *   (default: {@link LIST_DEFAULT_LIMIT})
+ */
+export function buildListLimitFlag(
+  entityPlural: string,
+  defaultValue = String(LIST_DEFAULT_LIMIT),
+): {
+  kind: "parsed";
+  parse: typeof numberParser;
+  brief: string;
+  default: string;
+} {
+  return {
+    kind: "parsed",
+    parse: numberParser,
+    brief: `Maximum number of ${entityPlural} to list`,
+    default: defaultValue,
+  };
+}
+
+/**
+ * The `--period` / `-t` flag for list commands that query time-bounded data.
+ *
+ * Controls the `statsPeriod` parameter sent to the Sentry Events API.
+ * Accepts relative durations (`"7d"`, `"24h"`), date ranges
+ * (`"2024-01-01..2024-02-01"`), and comparison operators (`">=2024-01-01"`).
+ *
+ * Stricli calls `parsePeriod` on both user input and the default value,
+ * so `flags.period` is always a `TimeRange` object — no manual
+ * `parsePeriod()` call needed in `func()`.
+ *
+ * Default is `"7d"` (7 days). Commands that need a different default (e.g.,
+ * `issue list` uses `"90d"`) should define their own flag inline with
+ * `parse: parsePeriod`.
+ *
+ * @example
+ * ```ts
+ * flags: { ..., period: LIST_PERIOD_FLAG },
+ * aliases: { ...PERIOD_ALIASES },
+ * ```
+ */
+export const LIST_PERIOD_FLAG = {
+  kind: "parsed" as const,
+  parse: parsePeriod,
+  brief: PERIOD_BRIEF,
+  default: "7d",
+};
+
+/**
+ * Alias map for the `--period` flag: `-t` → `--period`.
+ *
+ * Exported separately from `LIST_BASE_ALIASES` because not all list commands
+ * need a period flag, and some commands already use `-t` for other purposes.
+ */
+export const PERIOD_ALIASES = { t: "period" } as const;
+
+/**
+ * Alias map shared by all list commands.
+ * `-n` → `--limit`, `-c` → `--cursor`.
+ *
+ * Commands with additional flags should spread this and add their own aliases:
+ * ```ts
+ * aliases: { ...LIST_BASE_ALIASES, p: "platform" }
+ * ```
+ */
+export const LIST_BASE_ALIASES: Aliases<string> = { n: "limit", c: "cursor" };
+
+// ---------------------------------------------------------------------------
+// Level B: subcommand interception for plural aliases
+// ---------------------------------------------------------------------------
+
+/** Subcommand names by route group, per registered route map. */
+const subcommandsByRoutes = new WeakMap<CliRoutes, Map<string, Set<string>>>();
+
+/**
+ * Entry shape returned by Stricli's getAllEntries().
+ * `aliases` is always present at runtime (empty array when none),
+ * but typed as optional for defensive safety.
+ */
+type RouteEntry = {
+  name: { original: string };
+  aliases?: readonly string[];
+  target: unknown;
+};
+
+/** Collect all subcommand names and aliases from a route group's children. */
+function collectChildNames(parent: {
+  getAllEntries: () => readonly RouteEntry[];
+}): Set<string> {
+  const names = new Set<string>();
+  for (const child of parent.getAllEntries()) {
+    names.add(child.name.original);
+    for (const alias of child.aliases ?? []) {
+      names.add(alias);
+    }
+  }
+  return names;
+}
+
+/**
+ * Get the subcommand names for a given singular route (e.g. "project" → {"list", "view"}).
+ *
+ * Walks the registered route map once and caches the result for it. With no
+ * route map registered (a command's `func` called directly, as in unit
+ * tests), there are no subcommands to intercept.
+ */
+function getSubcommandsForRoute(routeName: string): Set<string> {
+  const routes = findRoutes();
+  if (!routes) {
+    return new Set();
+  }
+  let byRoute = subcommandsByRoutes.get(routes);
+  if (!byRoute) {
+    byRoute = new Map();
+    for (const entry of routes.getAllEntries()) {
+      const target = entry.target as unknown as Record<string, unknown>;
+      if (typeof target?.getAllEntries === "function") {
+        byRoute.set(
+          entry.name.original,
+          collectChildNames(
+            target as { getAllEntries: () => readonly RouteEntry[] },
+          ),
+        );
+      }
+    }
+    subcommandsByRoutes.set(routes, byRoute);
+  }
+  return byRoute.get(routeName) ?? new Set();
+}
+
+/**
+ * Check if a positional target is actually a subcommand name passed through
+ * a plural alias (e.g. "list" from `sentry projects list`).
+ *
+ * When a plural alias like `sentry projects` maps directly to the list
+ * command, Stricli passes extra tokens as positional args. If the token
+ * matches a known subcommand of the singular route, we treat it as if no
+ * target was given (auto-detect) and print a command-specific hint.
+ *
+ * @param target - The raw positional argument
+ * @param stderr - Writable stream for the hint message
+ * @param routeName - Singular route name (e.g. "project", "issue")
+ * @returns The original target, or `undefined` if it was a subcommand name
+ */
+export function interceptSubcommand(
+  target: string | undefined,
+  stderr: { write(s: string): void },
+  routeName: string,
+): string | undefined {
+  if (!(target && isSubcommandName(target, routeName))) {
+    return target;
+  }
+  stderr.write(
+    warning(
+      `Tip: "${target.trim()}" is a subcommand. Running: ${sentry`${routeName} ${target.trim()}`}\n`,
+    ),
+  );
+  return;
+}
+
+/** Whether `arg` names a subcommand of `routeName` (see {@link interceptSubcommand}). */
+function isSubcommandName(arg: string, routeName: string): boolean {
+  const trimmed = arg.trim();
+  return trimmed !== "" && getSubcommandsForRoute(routeName).has(trimmed);
+}
+
+// ---------------------------------------------------------------------------
+// Level C: list command builder with automatic subcommand interception
+// ---------------------------------------------------------------------------
+
+/** Base flags type (mirrors command.ts) */
+type BaseFlags = Readonly<Partial<Record<string, unknown>>>;
+
+/**
+ * Options for controlling which flags {@link buildListCommand} auto-injects.
+ *
+ * By default, `buildListCommand` adds `--fresh`, `--cursor`, and their aliases
+ * (`-f`, `-c`). Use these options to opt out when a command has conflicts.
+ */
+export type ListCommandOptions = {
+  /** Skip injecting `--cursor` flag and `-c` alias (e.g., log list uses streaming). */
+  noCursorFlag?: boolean;
+  /** Skip injecting `-f` alias for `--fresh` (e.g., log list uses `-f` for `--follow`). */
+  noFreshAlias?: boolean;
+};
+
+/**
+ * Build a Stricli command for a list endpoint with automatic plural-alias
+ * interception and common flag injection.
+ *
+ * This is a drop-in replacement for `buildCommand` that:
+ * 1. Intercepts subcommand names passed through plural aliases
+ * 2. Auto-injects `--fresh` and `--cursor` flags (unless already defined)
+ * 3. Auto-injects `-f` and `-c` aliases (with opt-outs via `options`)
+ * 4. Auto-calls `applyFreshFlag(flags)` before the command function runs
+ *
+ * Commands that define their own `cursor` or `fresh` flags (e.g., with a
+ * custom `brief`) keep theirs — auto-injection skips flags already present.
+ *
+ * @param routeName - Singular route name (e.g. "project", "issue") for the
+ *   hint message and subcommand lookup
+ * @param builderArgs - Same arguments as `buildCommand` from `lib/command.js`
+ * @param options - Control which flags are auto-injected
+ */
+export function buildListCommand<
+  const FLAGS extends BaseFlags = NonNullable<unknown>,
+  const ARGS extends readonly unknown[] = [],
+  const CONTEXT extends CommandContext = CommandContext,
+  OUTPUT = never,
+  SCHEMA extends GenericSchema = GenericSchema,
+  TRANSFORMED = unknown,
+>(
+  routeName: string,
+  builderArgs: {
+    readonly parameters?: Record<string, unknown>;
+    readonly docs: CommandDocumentation;
+    readonly func: SentryCommandFunction<FLAGS, ARGS, CONTEXT, NoInfer<OUTPUT>>;
+    readonly output?: OutputConfig<OUTPUT, SCHEMA, TRANSFORMED>;
+    readonly auth?: boolean;
+  },
+  options?: ListCommandOptions,
+): Command<CONTEXT> {
+  const originalFunc = builderArgs.func;
+
+  // Auto-inject common flags and aliases into parameters
+  const params = builderArgs.parameters ?? {};
+  const existingFlags = (params.flags ?? {}) as Record<string, unknown>;
+  const existingAliases = (params.aliases ?? {}) as Record<string, string>;
+
+  const mergedFlags = { ...existingFlags };
+  const mergedAliases = { ...existingAliases };
+
+  // Always inject --fresh unless the command already defines it
+  if (!("fresh" in mergedFlags)) {
+    mergedFlags.fresh = FRESH_FLAG;
+  }
+
+  // Inject --cursor unless opted out or already defined
+  if (!(options?.noCursorFlag || "cursor" in mergedFlags)) {
+    mergedFlags.cursor = LIST_CURSOR_FLAG;
+  }
+
+  // Inject -f alias unless opted out or already defined
+  if (!(options?.noFreshAlias || "f" in mergedAliases)) {
+    mergedAliases.f = "fresh";
+  }
+
+  // Inject -c alias unless cursor is opted out or already defined
+  if (!(options?.noCursorFlag || "c" in mergedAliases)) {
+    mergedAliases.c = "cursor";
+  }
+
+  // `boundArguments` positionals parse every argument before this wrapper
+  // runs, so a subcommand name is left out of that parse, before it changes
+  // what the other arguments mean
+  const positional = skipLeadingArgument(params.positional, (arg) =>
+    isSubcommandName(arg, routeName),
+  );
+  const mergedParams = {
+    ...params,
+    ...(positional ? { positional } : {}),
+    flags: mergedFlags,
+    aliases: mergedAliases,
+  };
+
+  // oxlint-disable-next-line typescript/no-explicit-any -- Stricli's CommandFunction type is complex
+  const wrappedFunc = function (this: CONTEXT, flags: FLAGS, ...args: any[]) {
+    // Auto-apply fresh flag before command runs
+    applyFreshFlag(flags as unknown as { readonly fresh: boolean });
+
+    // The first positional arg is always the target (org/project pattern),
+    // either a raw string or a parsed value. Intercept it to handle plural
+    // alias confusion. All list commands use SentryContext which has stderr
+    // at top level
+    const ctx = this as unknown as { stderr: { write(s: string): void } };
+    const skipped = skippedArgument(args[0]);
+    const rawTarget = rawPositional(args[0]);
+    if (skipped !== undefined) {
+      // The scanner already parsed the other arguments without it
+      interceptSubcommand(skipped, ctx.stderr, routeName);
+    } else if (
+      typeof rawTarget === "string" &&
+      interceptSubcommand(rawTarget, ctx.stderr, routeName) === undefined
+    ) {
+      args[0] = undefined;
+    }
+    // A dropped bound target becomes an omitted one (auto-detect)
+    const finalArgs = applyBoundPositionals(args, positional, this);
+    return originalFunc.call(this, flags, ...(finalArgs as unknown as ARGS));
+  } as typeof originalFunc;
+
+  return buildCommand<FLAGS, ARGS, CONTEXT, OUTPUT, SCHEMA, TRANSFORMED>({
+    ...builderArgs,
+    parameters: mergedParams,
+    func: wrappedFunc,
+    output: builderArgs.output,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Level D: full command builder for dispatchOrgScopedList-based commands
+// ---------------------------------------------------------------------------
+
+/** Documentation for a list command built with `buildOrgListCommand`. */
+export type OrgListCommandDocs = CommandDocumentation;
+
+/**
+ * Format a {@link ListResult} as human-readable output using the config's
+ * `displayTable` function. Handles empty results, headers, table body, and hints.
+ *
+ * @param result - The list result from a dispatch handler
+ * @param config - The OrgListConfig providing the `displayTable` renderer
+ * @returns Formatted string for terminal output
+ */
+function formatListHuman<TEntity, TWithOrg>(
+  result: ListResult<TWithOrg>,
+  config: OrgListConfig<TEntity, TWithOrg>,
+): string {
+  const parts: string[] = [];
+
+  if (result.items.length === 0) {
+    // Empty result — show the hint (which contains the "No X found" message)
+    if (result.hint) {
+      parts.push(result.hint);
+    }
+    return parts.join("\n");
+  }
+
+  // Table body
+  parts.push(config.displayTable(result.items));
+
+  // Header contains count info like "Showing N items (more available)"
+  if (result.header) {
+    parts.push(`\n${result.header}`);
+  }
+
+  return parts.join("");
+}
+
+// JSON transform is shared via jsonTransformListResult in org-list.ts
+
+/**
+ * Build a complete Stricli command whose entire `func` body delegates to
+ * `dispatchOrgScopedList`.
+ *
+ * This covers the team and repo list commands, where all runtime behaviour is
+ * encapsulated in the shared org-list framework. The resulting command has:
+ * - An optional positional `target` argument
+ * - `--limit` / `-n`, `--json`, `--fields`, `--cursor` / `-c` flags
+ * - A `func` that passes the resolved target to `dispatchOrgScopedList`
+ *
+ * Rendering is handled automatically via `OutputConfig`:
+ * - JSON mode produces paginated envelopes or flat arrays
+ * - Human mode uses the config's `displayTable` function
+ *
+ * @param config - The `OrgListConfig` that drives fetching and display
+ * @param docs   - Brief and optional full description for `--help`
+ * @param routeName - Singular route name for subcommand interception
+ */
+export function buildOrgListCommand<TEntity, TWithOrg>(
+  config: OrgListConfig<TEntity, TWithOrg>,
+  docs: OrgListCommandDocs,
+  routeName: string,
+): Command<SentryContext> {
+  // `OrgListConfig.schema` checks the entity against the schema; the generic
+  // `TWithOrg` can't be checked here, so the schema's type is erased.
+  const output: OutputConfig<ListResult<TWithOrg>> = {
+    human: (result: ListResult<TWithOrg>) => formatListHuman(result, config),
+    jsonTransform: (result: ListResult<TWithOrg>, fields?: string[]) =>
+      jsonTransformListResult(result, fields),
+    schema: config.schema,
+  };
+  return buildListCommand(routeName, {
+    docs,
+    output,
+    parameters: {
+      positional: config.namesOf
+        ? NAMED_LIST_ORG_TARGET_POSITIONAL
+        : LIST_ORG_TARGET_POSITIONAL,
+      flags: {
+        limit: buildListLimitFlag(config.entityPlural),
+      },
+      aliases: LIST_BASE_ALIASES,
+    },
+    async *func(
+      this: SentryContext,
+      flags: {
+        readonly limit: number;
+        readonly json: boolean;
+        readonly cursor?: string;
+        readonly fresh: boolean;
+        readonly fields?: string[];
+      },
+      target: ListCommandTarget,
+    ) {
+      const { cwd } = this;
+      const { parsed, filter } = await target.resolved;
+      const result = await dispatchOrgScopedList({
+        config,
+        cwd,
+        flags,
+        parsed,
+        filter,
+      });
+      yield new CommandOutput(result);
+      // Only forward hint to the footer when items exist — empty results
+      // already render hint text inside the human formatter.
+      const hint = result.items.length > 0 ? result.hint : undefined;
+      return { hint };
+    },
+  });
+}

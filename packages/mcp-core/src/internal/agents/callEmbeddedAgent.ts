@@ -5,7 +5,7 @@ import {
   NoOutputGeneratedError,
   Output,
   RetryError,
-  stepCountIs,
+  type StepResult,
   type Tool,
 } from "ai";
 import type { z } from "zod";
@@ -16,7 +16,11 @@ import {
   UserInputError,
 } from "../../errors";
 import { logIssue, logWarn } from "../../telem/logging";
+import { getUserAgent } from "../../version";
 import { getAgentProvider } from "./provider-factory";
+
+// Tool work gets this many model steps; a validated final response may get one more.
+const MAX_WORK_STEPS = 5;
 
 /**
  * Resolve the underlying provider failure from an AI SDK error.
@@ -104,21 +108,29 @@ interface EmbeddedAgentResult<T> {
  * - Errors are re-thrown for the calling agent to handle
  * - Each agent can implement its own error handling strategy
  */
-export async function callEmbeddedAgent<
-  TOutput,
-  TSchema extends z.ZodType<TOutput, unknown>,
->({
+export async function callEmbeddedAgent<TOutput>({
   system,
   prompt,
   tools,
   schema,
+  isReadyToFinalize,
 }: {
   system: string;
   prompt: string;
   tools: Record<string, Tool>;
-  schema: TSchema;
+  schema: z.ZodType<TOutput>;
+  /** Whether this step produced a result that permits a final response. */
+  isReadyToFinalize?: (step: StepResult<Record<string, Tool>>) => boolean;
 }): Promise<EmbeddedAgentResult<TOutput>> {
   const capturedToolCalls: ToolCall[] = [];
+
+  function shouldAllowFinalResponseStep(
+    steps: StepResult<Record<string, Tool>>[],
+  ): boolean {
+    if (steps.length !== MAX_WORK_STEPS) return false;
+    const lastStep = steps.at(-1);
+    return lastStep !== undefined && (isReadyToFinalize?.(lastStep) ?? false);
+  }
 
   // Get the configured provider (OpenAI, Azure OpenAI, or Anthropic)
   const provider = getAgentProvider();
@@ -126,10 +138,18 @@ export async function callEmbeddedAgent<
   try {
     const result = await generateText({
       model: provider.getModel(),
+      // generateText sets a call-level user-agent that replaces the
+      // providers' own, so ours has to go on the call too.
+      headers: { "User-Agent": getUserAgent() },
       system,
       prompt,
       tools,
-      stopWhen: stepCountIs(5),
+      stopWhen: ({ steps }) =>
+        steps.length >= MAX_WORK_STEPS && !shouldAllowFinalResponseStep(steps),
+      prepareStep: ({ steps }) => {
+        if (shouldAllowFinalResponseStep(steps)) return { toolChoice: "none" };
+        return undefined;
+      },
       experimental_output: Output.object({ schema }),
       experimental_telemetry: {
         isEnabled: true,
@@ -139,13 +159,11 @@ export async function callEmbeddedAgent<
       // See: https://github.com/getsentry/sentry-mcp/issues/623
       providerOptions: provider.getProviderOptions(),
       onStepFinish: (event) => {
-        if (event.toolCalls && event.toolCalls.length > 0) {
-          for (const toolCall of event.toolCalls) {
-            capturedToolCalls.push({
-              toolName: toolCall.toolName,
-              args: toolCall.input,
-            });
-          }
+        for (const toolCall of event.toolCalls) {
+          capturedToolCalls.push({
+            toolName: toolCall.toolName,
+            args: toolCall.input,
+          });
         }
       },
     });
@@ -161,7 +179,6 @@ export async function callEmbeddedAgent<
 
     if (
       typeof rawOutput === "object" &&
-      rawOutput !== null &&
       "error" in rawOutput &&
       typeof (rawOutput as { error?: unknown }).error === "string"
     ) {
@@ -351,7 +368,7 @@ function extractJsonCandidates(text: string): string[] {
 
   // Strategy 1: Extract from markdown code blocks (```json ... ``` or ``` ... ```)
   const codeBlockRegex = /```(?:json)?\s*\n?([\s\S]*?)\n?```/g;
-  const allMatches = Array.from(text.matchAll(codeBlockRegex));
+  const allMatches = [...text.matchAll(codeBlockRegex)];
   for (const match of allMatches) {
     candidates.add(match[1].trim());
   }
@@ -361,7 +378,7 @@ function extractJsonCandidates(text: string): string[] {
     candidates.add(jsonObject);
   }
 
-  return Array.from(candidates);
+  return [...candidates];
 }
 
 /**
@@ -372,7 +389,7 @@ function extractJsonCandidates(text: string): string[] {
  */
 function rescueFromText<TOutput>(
   text: string,
-  schema: z.ZodType<TOutput, unknown>,
+  schema: z.ZodType<TOutput>,
 ): TOutput | null {
   for (const candidate of extractJsonCandidates(text)) {
     try {

@@ -2,6 +2,7 @@
 
 import "asciinema-player/dist/bundle/asciinema-player.css";
 import "./dracula.css";
+import type { Marker } from "asciinema-player";
 import { useCallback, useEffect, useRef, useState } from "react";
 import BrowserAnimation from "./BrowserAnimation";
 import KeysPaste from "./terminal-ui/keys-paste";
@@ -195,11 +196,12 @@ export default function TerminalAnimation() {
       isMobileRef.current = false;
     }
 
-    const AsciinemaPlayerLibrary = await import("asciinema-player" as any);
+    if (typeof WebAssembly === "undefined") return;
+    const AsciinemaPlayerLibrary = await import("asciinema-player");
     if (!cliDemoRef.current) return;
 
     // Convert steps to markers format: [time, label]
-    const markers = steps.map((step) => [step.startTime, step.label]);
+    const markers = steps.map((step): Marker => [step.startTime, step.label]);
 
     const player = AsciinemaPlayerLibrary.create(
       "demo.cast",
@@ -268,7 +270,7 @@ export default function TerminalAnimation() {
     if (didInitRef.current) return;
     didInitRef.current = true;
 
-    (async () => {
+    void (async () => {
       await mountOnce();
       // Start playing from the first marker
       setTimeout(() => {

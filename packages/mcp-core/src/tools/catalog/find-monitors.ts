@@ -1,16 +1,15 @@
 import { z } from "zod";
-import { setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
-import { apiServiceFromContext } from "../../internal/tool-helpers/api";
-import { structuredResult } from "../../internal/tool-helpers/results";
 import type { Monitor } from "../../api-client/types";
-import type { ServerContext } from "../../types";
+import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
+import { structuredResult } from "../../internal/tool-helpers/results";
 import {
   ParamOrganizationSlug,
   ParamProjectSlugOrAll,
   ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
+import type { ServerContext } from "../../types";
 import { assertProjectRefWithinConstraint } from "./support/project-constraints";
 
 const ENVIRONMENT_LIMIT = 5;
@@ -138,10 +137,12 @@ function getSchedule(monitor: Monitor) {
 
 export default defineTool({
   name: "find_monitors",
+  title: "Find Cron Monitors",
   skills: ["inspect"],
   requiredScopes: ["org:read"],
   description: [
-    "Find Sentry cron monitors.",
+    "List or search Sentry cron monitors, which track scheduled jobs through check-ins.",
+    "For HTTP uptime checks use find_uptime_monitors; for metric thresholds use find_metric_monitors.",
     "",
     "Use this tool when you need to:",
     "- List cron monitors in an organization",
@@ -197,7 +198,6 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
-    setOrganizationContext(organizationSlug);
     const requestedProjectSlug =
       params.projectSlug && params.projectSlug !== "all"
         ? params.projectSlug
@@ -210,9 +210,7 @@ export default defineTool({
       });
     }
     const projectSlug = context.constraints.projectSlug ?? requestedProjectSlug;
-    if (projectSlug) {
-      setTag("project.slug", projectSlug);
-    }
+    setTargetTagsAndAttributes({ organizationSlug, projectSlug });
 
     const monitors = await apiService.listMonitors({
       organizationSlug,

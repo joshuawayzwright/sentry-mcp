@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   collectRequestedEnvironments,
   formatUnknownEnvironmentNote,
-} from "./search-events";
+} from "../support/search-events/search";
 
 describe("collectRequestedEnvironments", () => {
   it("collects from the separate environment field (string and array)", () => {
@@ -58,6 +58,21 @@ describe("collectRequestedEnvironments", () => {
         'deployment.environment:prod environment:qa message:"environment:bar"',
       ),
     ).toEqual(["qa"]);
+  });
+
+  it("keeps regex values with spaces and apostrophes as one token", () => {
+    expect(
+      collectRequestedEnvironments(
+        null,
+        "message://can't connect// environment:qa",
+      ),
+    ).toEqual(["qa"]);
+    expect(
+      collectRequestedEnvironments(null, "message://a environment:foo b//"),
+    ).toEqual([]);
+    expect(
+      collectRequestedEnvironments(null, "(message://a environment:foo b//)"),
+    ).toEqual([]);
   });
 });
 

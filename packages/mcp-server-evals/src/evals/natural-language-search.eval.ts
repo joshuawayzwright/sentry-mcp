@@ -1,7 +1,7 @@
 import { SentryApiService } from "@sentry/mcp-core/api-client";
 import { searchEventsAgent } from "@sentry/mcp-core/tools/search-events/agent";
 import { searchIssuesAgent } from "@sentry/mcp-core/tools/search-issues/agent";
-import { describeEval, ToolCallScorer } from "vitest-evals";
+import { describeEval, ToolCallScorer } from "vitest-evals/legacy";
 import "../setup-env";
 import { StructuredOutputScorer } from "./utils/structuredOutputScorer";
 
@@ -72,7 +72,7 @@ describeEval("natural-language-search-events", {
           value.includes("metric.type:distribution"),
         fields: (value: unknown) =>
           Array.isArray(value) &&
-          value.includes("environment") &&
+          value.includes("sentry.environment") &&
           value.includes(
             "p95(value,http.request.duration,distribution,millisecond)",
           ),

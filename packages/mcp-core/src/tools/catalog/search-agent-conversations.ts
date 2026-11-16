@@ -2,20 +2,20 @@
 // Sentry's conversation list endpoint and intentionally exposes backend default
 // ordering until alternate sorting is applied by the API.
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
+import type { AIConversationSummary, SentryApiService } from "../../api-client";
+import { UserInputError } from "../../errors";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
+import { structuredResult } from "../../internal/tool-helpers/results";
 import {
   ParamOrganizationSlug,
   ParamPeriod,
-  ParamRegionUrl,
   ParamProjectSlug,
+  ParamRegionUrl,
 } from "../../schema";
-import { UserInputError } from "../../errors";
-import { structuredResult } from "../../internal/tool-helpers/results";
-import { isNumericId } from "../../utils/slug-validation";
-import type { AIConversationSummary, SentryApiService } from "../../api-client";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
+import { isNumericId } from "../../utils/slug-validation";
 
 const PREVIEW_LENGTH = 240;
 const TRACE_ID_SAMPLE_SIZE = 3;
@@ -96,7 +96,7 @@ async function resolveProjectIds({
     return undefined;
   }
 
-  return Promise.all(
+  return await Promise.all(
     projects.map(async (projectSlugOrId) => {
       if (projectSlugOrId === "-1" || isNumericId(projectSlugOrId)) {
         return projectSlugOrId;
@@ -200,6 +200,7 @@ function buildArtifact(
 
 export default defineTool({
   name: "search_agent_conversations",
+  title: "Search Agent Conversations",
   skills: ["inspect", "triage", "seer"],
   requiredScopes: ["event:read", "project:read"],
   description: [
@@ -263,14 +264,14 @@ export default defineTool({
     if ((params.start && !params.end) || (!params.start && params.end)) {
       throw new UserInputError("`start` and `end` must be provided together.");
     }
-    const requestedPeriod = params.period ?? "30d";
+    const requestedPeriod = params.period;
 
     const apiService = apiServiceFromContext(context, {
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
 
-    setOrganizationContext(organizationSlug);
+    setTargetTagsAndAttributes({ organizationSlug });
 
     const projectIds = await resolveProjectIds({
       apiService,

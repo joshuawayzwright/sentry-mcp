@@ -1,14 +1,14 @@
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
-import type { ServerContext } from "../../types";
 import {
   ParamOrganizationSlug,
-  ParamRegionUrl,
   ParamProjectSlugOrAll,
+  ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
+import type { ServerContext } from "../../types";
 
 const RESULT_LIMIT = 25;
 
@@ -45,10 +45,11 @@ export const findReleasesOutputSchema = z.object({
 
 export default defineTool({
   name: "find_releases",
+  title: "Find Releases",
   skills: ["inspect"], // Only available in inspect skill
   requiredScopes: ["project:read"],
   description: [
-    "Find releases in Sentry.",
+    "List or search releases (deployed versions) in a Sentry organization or project.",
     "",
     "Use this tool when you need to:",
     "- Find recent releases in a Sentry organization",
@@ -98,7 +99,7 @@ export default defineTool({
     });
     const organizationSlug = params.organizationSlug;
 
-    setOrganizationContext(organizationSlug);
+    setTargetTagsAndAttributes({ organizationSlug });
 
     const releases = await apiService.listReleases({
       organizationSlug,

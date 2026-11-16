@@ -62,7 +62,7 @@ const app = new Hono<{
   .get("/", async (c, next) => {
     const accept = c.req.header("Accept") ?? "";
     if (!accept.includes("text/markdown")) {
-      return next();
+      return await next();
     }
     return c.text(generateHomepageMarkdown(getBaseUrl(c)), 200, {
       "Content-Type": "text/markdown; charset=utf-8",
@@ -85,6 +85,9 @@ const app = new Hono<{
     return c.text(generateHomepageMarkdown(getBaseUrl(c)), 200, {
       "Content-Type": "text/plain; charset=utf-8",
     });
+  })
+  .get("/_health/version", (c) => {
+    return c.json({ id: c.env?.CF_VERSION_METADATA?.id ?? null });
   })
   .get("/mcp.json", (c) => {
     const baseUrl = getBaseUrl(c);

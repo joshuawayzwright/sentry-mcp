@@ -1,0 +1,445 @@
+/**
+ * sentry replay list
+ *
+ * List Session Replays from Sentry.
+ */
+
+import { tableCell } from "@sentry/toolkit-core/markdown";
+import type { SentryContext } from "../../context.js";
+import {
+  isReplaySortValue,
+  listReplays,
+  type ReplaySortValue,
+} from "../../lib/api-client.js";
+import { sentry } from "../../lib/app-identity.js";
+import { validateLimit } from "../../lib/arg-parsing.js";
+import {
+  choiceParser,
+  parseEnvironmentList,
+  textParser,
+} from "../../lib/completion-target.js";
+import {
+  advancePaginationState,
+  buildPaginationContextKey,
+  hasPreviousPage,
+  resolveCursor,
+} from "../../lib/db/pagination.js";
+import { toSearchQueryError } from "../../lib/errors.js";
+import { formatRelativeTime, formatTable } from "../../lib/formatters/index.js";
+import { filterFields } from "../../lib/formatters/json.js";
+import { CommandOutput } from "../../lib/formatters/output.js";
+import type { Column } from "../../lib/formatters/table.js";
+import { formatDurationCompact } from "../../lib/formatters/time-utils.js";
+import {
+  appendQueryHint,
+  appendSortHint,
+  buildListCommand,
+  LIST_DEFAULT_LIMIT,
+  LIST_MAX_LIMIT,
+  LIST_MIN_LIMIT,
+  LIST_PERIOD_FLAG,
+  ORG_ALL_TARGET_BRIEF,
+  PERIOD_ALIASES,
+  paginationHint,
+  targetPatternExplanation,
+} from "../../lib/list-command.js";
+import type { ListEnvelope } from "../../lib/org-list.js";
+import { withProgress } from "../../lib/polling.js";
+import {
+  getReplayUserLabel,
+  parseReplayEnvironmentFilter,
+} from "../../lib/replay-search.js";
+import { sanitizeQuery } from "../../lib/search-query.js";
+import {
+  type OrgOptionalTarget,
+  orgOptionalTarget,
+} from "../../lib/target-positional.js";
+import {
+  appendPeriodHint,
+  serializeTimeRange,
+  type TimeRange,
+  timeRangeToApiParams,
+} from "../../lib/time-range.js";
+import { REPLAY_LIST_FIELDS, type ReplayListItem } from "../../types/index.js";
+import { ReplayListItemOutputSchema } from "../../generated/output-schemas/replay.js";
+
+type ListFlags = {
+  readonly environment?: readonly string[];
+  readonly limit: number;
+  readonly query?: string;
+  readonly sort: ReplaySortValue;
+  readonly period: TimeRange;
+  readonly json: boolean;
+  readonly cursor?: string;
+  readonly fresh: boolean;
+  readonly fields?: string[];
+};
+
+type ReplayListResult = {
+  replays: ReplayListItem[];
+  hasMore: boolean;
+  hasPrev: boolean;
+  nextCursor?: string | null;
+  org: string;
+  project?: string;
+};
+
+type ReplaySortKey = "date" | "oldest" | "duration" | "errors" | "activity";
+
+const SORT_MAP: Record<ReplaySortKey, ReplaySortValue> = {
+  date: "-started_at",
+  oldest: "started_at",
+  duration: "-duration",
+  errors: "-count_errors",
+  activity: "-activity",
+};
+
+const DEFAULT_PERIOD = LIST_PERIOD_FLAG.default;
+const DEFAULT_SORT: ReplaySortValue = SORT_MAP.date;
+const PAGINATION_KEY = "replay-list";
+
+function parseLimit(value: string): number {
+  return validateLimit(value, LIST_MIN_LIMIT, LIST_MAX_LIMIT);
+}
+
+/**
+ * Parse user-facing replay sort values into API sort expressions.
+ */
+export function parseSort(value: string): ReplaySortValue {
+  const trimmed = value.trim();
+  const normalized = trimmed.toLowerCase() as ReplaySortKey;
+  const mapped = SORT_MAP[normalized];
+  if (mapped) {
+    return mapped;
+  }
+
+  if (isReplaySortValue(trimmed)) {
+    return trimmed;
+  }
+
+  throw new Error(
+    `Invalid sort value. Must be one of: ${Object.keys(SORT_MAP).join(", ")} or a replay sort like -count_rage_clicks`,
+  );
+}
+
+function formatCount(value: number | null | undefined): string {
+  return value === null || value === undefined ? "0" : String(value);
+}
+
+function replayUserLabel(replay: ReplayListItem): string {
+  return getReplayUserLabel(replay) ?? "—";
+}
+
+const REPLAY_COLUMNS: Column<ReplayListItem>[] = [
+  {
+    header: "ID",
+    value: (replay) => `\`${replay.id}\``,
+    minWidth: 32,
+    shrinkable: false,
+  },
+  {
+    header: "STARTED",
+    value: (replay) => formatRelativeTime(replay.started_at ?? undefined),
+    minWidth: 10,
+  },
+  {
+    header: "DURATION",
+    value: (replay) => formatDurationCompact(replay.duration),
+    minWidth: 10,
+  },
+  {
+    header: "ERRORS",
+    value: (replay) => formatCount(replay.count_errors),
+    align: "right",
+    minWidth: 6,
+  },
+  {
+    header: "SEGMENTS",
+    value: (replay) => formatCount(replay.count_segments),
+    align: "right",
+    minWidth: 8,
+  },
+  {
+    header: "USER",
+    value: (replay) => tableCell(replayUserLabel(replay)),
+    minWidth: 16,
+    truncate: true,
+  },
+  {
+    header: "PROJECT",
+    value: (replay) =>
+      replay.project_id !== null && replay.project_id !== undefined
+        ? String(replay.project_id)
+        : "—",
+    minWidth: 7,
+  },
+];
+
+function formatScope(org: string, project?: string): string {
+  return project ? `${org}/${project}` : `${org}/`;
+}
+
+function appendReplayFlags(
+  base: string,
+  flags: Pick<ListFlags, "environment" | "query" | "sort" | "period">,
+): string {
+  const parts: string[] = [];
+  appendQueryHint(parts, flags.query);
+  appendSortHint(parts, flags.sort, DEFAULT_SORT);
+  if (flags.environment && flags.environment.length > 0) {
+    for (const environment of flags.environment) {
+      parts.push(`-e "${environment}"`);
+    }
+  }
+  appendPeriodHint(parts, flags.period, DEFAULT_PERIOD);
+  return parts.length > 0 ? `${base} ${parts.join(" ")}` : base;
+}
+
+function nextPageHint(
+  org: string,
+  project: string | undefined,
+  flags: Pick<ListFlags, "environment" | "query" | "sort" | "period">,
+): string {
+  return appendReplayFlags(
+    sentry`replay list ${formatScope(org, project)} -c next`,
+    flags,
+  );
+}
+
+function prevPageHint(
+  org: string,
+  project: string | undefined,
+  flags: Pick<ListFlags, "environment" | "query" | "sort" | "period">,
+): string {
+  return appendReplayFlags(
+    sentry`replay list ${formatScope(org, project)} -c prev`,
+    flags,
+  );
+}
+
+function formatReplayListHuman(result: ReplayListResult): string {
+  const { replays, hasMore, org, project } = result;
+  if (replays.length === 0) {
+    return hasMore ? "No replays on this page." : "No replays found.";
+  }
+
+  const scope = project ? `${org}/${project}` : `${org} (all projects)`;
+  return `Recent replays in ${scope}:\n\n${formatTable(replays, REPLAY_COLUMNS, { truncate: true })}`;
+}
+
+function jsonTransformReplayList(
+  result: ReplayListResult,
+  fields?: string[],
+): ListEnvelope<ReplayListItem> {
+  const items =
+    fields && fields.length > 0
+      ? result.replays.map((replay) => filterFields(replay, fields))
+      : result.replays;
+
+  const envelope: ListEnvelope<ReplayListItem> = {
+    data: items,
+    hasMore: result.hasMore,
+    hasPrev: result.hasPrev,
+  };
+  if (
+    result.nextCursor !== null &&
+    result.nextCursor !== undefined &&
+    result.nextCursor !== ""
+  ) {
+    envelope.nextCursor = result.nextCursor;
+  }
+  return envelope;
+}
+
+export const listCommand = buildListCommand("replay", {
+  docs: {
+    brief: "List recent Session Replays",
+    fullDescription:
+      "List recent Session Replays from Sentry.\n\n" +
+      `${targetPatternExplanation()}\n\n` +
+      "Alias: `sentry replays` → `sentry replay list`",
+    examples: [
+      {
+        description: "List recent replays (project auto-detected)",
+        run: "replay list",
+      },
+      {
+        description: "List recent replays for a project",
+        run: "replay list my-org/frontend",
+      },
+      {
+        description: "Search across all projects in an organization",
+        run: 'replay list my-org/ --query "environment:production"',
+      },
+      {
+        description: "Change the time window and sort",
+        run: "replay list my-org/frontend --period 24h --sort errors",
+      },
+      {
+        description: "Find replays for a user",
+        run: 'replay list my-org/frontend -q "user.email:foo@example.com"',
+      },
+      {
+        description: "Filter by environments",
+        run: "replay list my-org/frontend -e production -e canary",
+      },
+      {
+        description: "Show more results",
+        run: "replay list my-org/frontend --limit 50",
+      },
+      {
+        description: "Fetch the next page",
+        run: "replay list my-org/frontend -c next",
+      },
+      {
+        description: "Fetch the previous page",
+        run: "replay list my-org/frontend -c prev",
+      },
+      {
+        description: "Output as JSON",
+        run: "replay list my-org/frontend --json",
+      },
+      {
+        description: "Find a project across organizations",
+        run: "replay list frontend",
+      },
+    ],
+  },
+  output: {
+    human: formatReplayListHuman,
+    jsonTransform: jsonTransformReplayList,
+    schema: ReplayListItemOutputSchema,
+  },
+  parameters: {
+    positional: {
+      kind: "tuple",
+      parameters: [
+        {
+          placeholder: "org/project",
+          brief: ORG_ALL_TARGET_BRIEF,
+          parse: orgOptionalTarget,
+          optional: true,
+        },
+      ],
+    },
+    flags: {
+      limit: {
+        kind: "parsed",
+        parse: textParser(parseLimit),
+        brief: `Number of replays (${LIST_MIN_LIMIT}-${LIST_MAX_LIMIT})`,
+        default: String(LIST_DEFAULT_LIMIT),
+      },
+      query: {
+        kind: "parsed",
+        parse: sanitizeQuery,
+        brief: "Search query (Sentry replay search syntax)",
+        optional: true,
+      },
+      environment: {
+        kind: "parsed",
+        parse: parseEnvironmentList,
+        brief: "Filter by environment (repeatable, comma-separated)",
+        variadic: true,
+        optional: true,
+      },
+      sort: {
+        kind: "parsed",
+        parse: choiceParser(Object.keys(SORT_MAP), parseSort),
+        brief:
+          "Sort by: date, oldest, duration, errors, activity, or a raw replay sort field",
+        default: "date",
+      },
+      period: LIST_PERIOD_FLAG,
+    },
+    aliases: {
+      ...PERIOD_ALIASES,
+      e: "environment",
+      n: "limit",
+      q: "query",
+      s: "sort",
+    },
+  },
+  async *func(
+    this: SentryContext,
+    flags: ListFlags,
+    target: OrgOptionalTarget,
+  ) {
+    const timeRange = flags.period;
+    const environment = parseReplayEnvironmentFilter(flags.environment);
+    const { query } = flags;
+
+    const resolved = await target.resolved;
+
+    const contextKey = buildPaginationContextKey(
+      "replay",
+      formatScope(resolved.org, resolved.project),
+      {
+        env: environment?.join(","),
+        sort: flags.sort,
+        q: query,
+        period: serializeTimeRange(timeRange),
+      },
+    );
+    const { cursor, direction } = resolveCursor(
+      flags.cursor,
+      PAGINATION_KEY,
+      contextKey,
+    );
+
+    const { data: replays, nextCursor } = await withProgress(
+      {
+        message: `Fetching replays (up to ${flags.limit})...`,
+        json: flags.json,
+      },
+      () =>
+        listReplays(resolved.org, {
+          environment,
+          fields: [...REPLAY_LIST_FIELDS],
+          limit: flags.limit,
+          query,
+          projectSlugs: resolved.project ? [resolved.project] : undefined,
+          sort: flags.sort,
+          cursor,
+          ...timeRangeToApiParams(timeRange),
+        }).catch((error: unknown): never => {
+          // An unparseable user --query is a user input mistake, not a CLI bug.
+          throw toSearchQueryError(error, flags.query);
+        }),
+    );
+
+    advancePaginationState(PAGINATION_KEY, contextKey, direction, nextCursor);
+    const hasPrev = hasPreviousPage(PAGINATION_KEY, contextKey);
+    const hasMore = !!nextCursor;
+
+    const nav = paginationHint({
+      hasMore,
+      hasPrev,
+      prevHint: prevPageHint(resolved.org, resolved.project, flags),
+      nextHint: nextPageHint(resolved.org, resolved.project, flags),
+    });
+
+    let hint: string | undefined;
+    if (replays.length === 0 && nav) {
+      hint = `No replays on this page. ${nav}`;
+    } else if (replays.length > 0) {
+      const countText = `Showing ${replays.length} replay${replays.length === 1 ? "" : "s"}.`;
+      const firstReplay = replays[0];
+      const replayHint = firstReplay
+        ? `Use '${sentry`replay view ${resolved.org}/${firstReplay.id}`}' for details.`
+        : undefined;
+      hint = nav
+        ? `${countText} ${nav}`
+        : [countText, replayHint].filter(Boolean).join(" ");
+    }
+
+    yield new CommandOutput({
+      replays,
+      hasMore,
+      hasPrev,
+      nextCursor,
+      org: resolved.org,
+      project: resolved.project,
+    });
+    return { hint };
+  },
+});

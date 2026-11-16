@@ -4,8 +4,9 @@ import {
   createUnsupportedIssue,
   mswServer,
 } from "@sentry/mcp-server-mocks";
-import { http, HttpResponse } from "msw";
+import { http, HttpResponse, type JsonBodyType } from "msw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { formatErrorForUser } from "../../internal/error-handling.js";
 import analyzeIssueWithSeer from "./analyze-issue-with-seer.js";
 
 describe("analyze_issue_with_seer", () => {
@@ -55,42 +56,6 @@ describe("analyze_issue_with_seer", () => {
     expect(result).toContain("## Analysis Complete");
     expect(result).toContain('<seer_analysis run_id="13" step="root_cause">');
     expect(result).toContain("The analysis has completed successfully.");
-  });
-
-  it("uses formatted.content from the autofix endpoint when present", async () => {
-    mswServer.use(
-      http.get(
-        "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-FMT/autofix/",
-        () =>
-          HttpResponse.json({
-            autofix: { run_id: 42, status: "completed", blocks: [] },
-            formatted: {
-              format: "markdown",
-              content: "## Root Cause\n\nSHARED-AUTOFIX-MARKER",
-            },
-          }),
-      ),
-    );
-
-    const result = await analyzeIssueWithSeer.handler(
-      {
-        organizationSlug: "sentry-mcp-evals",
-        regionUrl: null,
-        instruction: undefined,
-        issueId: "CLOUDFLARE-MCP-FMT",
-        issueUrl: undefined,
-      },
-      {
-        constraints: { organizationSlug: undefined },
-        accessToken: "access-token",
-        userId: "1",
-      },
-    );
-
-    expect(result).toContain("SHARED-AUTOFIX-MARKER"); // body from the shared /autofix/ formatter
-    // LLM-generated content is still wrapped in the untrusted-data boundary
-    expect(result).toContain('<seer_analysis run_id="42" step="analysis">');
-    expect(result).toContain("</seer_analysis>");
   });
 
   it("wraps completed Seer-authored sections with provenance tags", async () => {
@@ -404,8 +369,9 @@ describe("analyze_issue_with_seer", () => {
     );
   });
 
-  it("handles start autofix with instruction", async () => {
+  async function startNewAnalysis(instruction: string | undefined) {
     let getCallCount = 0;
+    let requestBody: unknown;
 
     mswServer.use(
       http.get(
@@ -423,11 +389,7 @@ describe("analyze_issue_with_seer", () => {
       http.post(
         "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-NEW/autofix/",
         async ({ request }) => {
-          const body = await request.json();
-          expect(body).toEqual({
-            event_id: undefined,
-            instruction: "Focus on memory leaks",
-          });
+          requestBody = await request.json();
           return HttpResponse.json({
             run_id: 123,
           });
@@ -440,7 +402,7 @@ describe("analyze_issue_with_seer", () => {
         organizationSlug: "sentry-mcp-evals",
         regionUrl: null,
         issueId: "CLOUDFLARE-MCP-NEW",
-        instruction: "Focus on memory leaks",
+        instruction,
       },
       {
         constraints: {
@@ -455,10 +417,361 @@ describe("analyze_issue_with_seer", () => {
     await vi.runAllTimersAsync();
 
     const result = await promise;
+    return { result, requestBody };
+  }
 
+  it("sends the instruction to Seer as user_context", async () => {
+    const { result, requestBody } = await startNewAnalysis(
+      "Focus on memory leaks",
+    );
+
+    expect(requestBody).toEqual({ user_context: "Focus on memory leaks" });
     expect(result).toContain("Starting new analysis...");
     expect(result).toContain("Analysis started with Run ID: 123");
     expect(result).toContain("## Analysis Complete");
+  });
+
+  it.each([undefined, ""])(
+    "omits user_context when the instruction is %j",
+    async (instruction) => {
+      const { requestBody } = await startNewAnalysis(instruction);
+
+      expect(requestBody).toEqual({});
+    },
+  );
+
+  it.each([
+    [
+      "out of credits",
+      {
+        detail:
+          "Your organization does not have enough credits to start an Autofix run.",
+        code: "seer_out_of_credits",
+      },
+      "Your organization does not have enough credits to start an Autofix run. Someone with billing access can adjust Seer spend and auto-reload in Sentry.",
+    ],
+    [
+      "out of quota",
+      { detail: "No budget for Seer Autofix.", code: "seer_out_of_quota" },
+      "Your organization does not have enough Seer quota to start an Autofix run.",
+    ],
+    [
+      "out of quota, older Sentry without a code",
+      "No budget for Seer Autofix.",
+      "Your organization does not have enough Seer quota to start an Autofix run.",
+    ],
+  ])(
+    "explains why the run did not start when Sentry answers 402 (%s)",
+    async (_label, body, expected) => {
+      let getCallCount = 0;
+
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-402/autofix/",
+          () => {
+            getCallCount++;
+            return HttpResponse.json({ autofix: null });
+          },
+        ),
+        http.post(
+          "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-402/autofix/",
+          () => HttpResponse.json(body, { status: 402 }),
+        ),
+      );
+
+      const result = await analyzeIssueWithSeer.handler(
+        {
+          organizationSlug: "sentry-mcp-evals",
+          regionUrl: null,
+          issueId: "CLOUDFLARE-MCP-402",
+          instruction: undefined,
+        },
+        {
+          constraints: { organizationSlug: undefined },
+          accessToken: "access-token",
+          userId: "1",
+        },
+      );
+
+      expect(result).toBe(
+        `# Seer Analysis for Issue CLOUDFLARE-MCP-402\n\n## Analysis Not Started\n\n${expected}\n`,
+      );
+      // No polling after a refused start.
+      expect(getCallCount).toBe(1);
+    },
+  );
+
+  it.each([
+    [
+      "repos_not_linked",
+      "Seer Autofix requires repositories to be connected to this project before a new run can be started.",
+    ],
+    [
+      "scm_integration_required",
+      "Seer Autofix requires a supported SCM integration (GitHub or GitLab) to be installed for your organization before a new run can be started.",
+    ],
+  ])(
+    "explains why the run did not start when Sentry answers 409 (%s)",
+    async (code, detail) => {
+      let getCallCount = 0;
+
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-409/autofix/",
+          () => {
+            getCallCount++;
+            return HttpResponse.json({ autofix: null });
+          },
+        ),
+        http.post(
+          "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-409/autofix/",
+          () => HttpResponse.json({ detail, code }, { status: 409 }),
+        ),
+      );
+
+      const result = await analyzeIssueWithSeer.handler(
+        {
+          organizationSlug: "sentry-mcp-evals",
+          regionUrl: null,
+          issueId: "CLOUDFLARE-MCP-409",
+          instruction: undefined,
+        },
+        {
+          constraints: { organizationSlug: undefined },
+          accessToken: "access-token",
+          userId: "1",
+        },
+      );
+
+      expect(result).toBe(
+        `# Seer Analysis for Issue CLOUDFLARE-MCP-409\n\n## Analysis Not Started\n\n${detail}\n\nRetrying won't help until someone sets this up in Sentry. Investigate without Seer by reading the issue and its events.\n`,
+      );
+      // No polling after a refused start.
+      expect(getCallCount).toBe(1);
+    },
+  );
+
+  it("still throws a 409 that is not a setup code", async () => {
+    mswServer.use(
+      http.get(
+        "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-409-OTHER/autofix/",
+        () => HttpResponse.json({ autofix: null }),
+      ),
+      http.post(
+        "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-409-OTHER/autofix/",
+        () =>
+          HttpResponse.json(
+            { detail: "Something else conflicted" },
+            { status: 409 },
+          ),
+      ),
+    );
+
+    await expect(
+      analyzeIssueWithSeer.handler(
+        {
+          organizationSlug: "sentry-mcp-evals",
+          regionUrl: null,
+          issueId: "CLOUDFLARE-MCP-409-OTHER",
+          instruction: undefined,
+        },
+        {
+          constraints: { organizationSlug: undefined },
+          accessToken: "access-token",
+          userId: "1",
+        },
+      ),
+    ).rejects.toThrow("Something else conflicted");
+  });
+
+  it("names the accepted scopes when Sentry refuses the start for a missing scope", async () => {
+    mswServer.use(
+      http.get(
+        "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-403/autofix/",
+        () => HttpResponse.json({ autofix: null }),
+      ),
+      http.post(
+        "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-403/autofix/",
+        () =>
+          HttpResponse.json(
+            { detail: "You do not have permission to perform this action." },
+            {
+              status: 403,
+              headers: {
+                "WWW-Authenticate":
+                  'Bearer error="insufficient_scope", scope="event:admin event:write seer:write"',
+              },
+            },
+          ),
+      ),
+    );
+
+    const error = await analyzeIssueWithSeer
+      .handler(
+        {
+          organizationSlug: "sentry-mcp-evals",
+          regionUrl: null,
+          issueId: "CLOUDFLARE-MCP-403",
+          instruction: undefined,
+        },
+        {
+          constraints: { organizationSlug: undefined },
+          accessToken: "access-token",
+          userId: "1",
+        },
+      )
+      .catch((e: unknown) => e);
+
+    expect(await formatErrorForUser(error, { transport: "http" })).toBe(
+      [
+        "**Missing Permission**",
+        "API error (403): You do not have permission to perform this action. The access token is missing the scope this endpoint requires; it needs one of: event:admin, event:write, seer:write. Retrying with the same token will not help.",
+        "Reconnect Sentry with a token or authorization that includes one of these scopes, then try again.",
+      ].join("\n\n"),
+    );
+  });
+
+  const RESTART_URL =
+    "https://sentry.io/api/0/organizations/sentry-mcp-evals/issues/CLOUDFLARE-MCP-RESTART/autofix/";
+
+  function failedRun(
+    runId: number,
+    failureReason?: string,
+    blocks: JsonBodyType[] = [],
+  ) {
+    return {
+      autofix: {
+        run_id: runId,
+        status: "error",
+        failure_reason: failureReason,
+        blocks,
+      },
+    };
+  }
+
+  function completedRun(runId: number) {
+    return {
+      ...autofixStateFixture,
+      autofix: { ...autofixStateFixture.autofix, run_id: runId },
+    };
+  }
+
+  /**
+   * Serves `states` to successive GETs (repeating the last one), answers the
+   * POST with `postResponse`, and counts POSTs.
+   */
+  async function analyzeWithStates(
+    states: JsonBodyType[],
+    postResponse: () => Response = () => HttpResponse.json({ run_id: 789 }),
+  ) {
+    let getCallCount = 0;
+    let postCallCount = 0;
+
+    mswServer.use(
+      http.get(RESTART_URL, () => {
+        const state = states[Math.min(getCallCount, states.length - 1)];
+        getCallCount++;
+        return HttpResponse.json(state);
+      }),
+      http.post(RESTART_URL, () => {
+        postCallCount++;
+        return postResponse();
+      }),
+    );
+
+    const promise = analyzeIssueWithSeer.handler(
+      {
+        organizationSlug: "sentry-mcp-evals",
+        regionUrl: null,
+        issueId: "CLOUDFLARE-MCP-RESTART",
+        instruction: undefined,
+      },
+      {
+        constraints: { organizationSlug: undefined },
+        accessToken: "access-token",
+        userId: "1",
+      },
+    );
+
+    await vi.runAllTimersAsync();
+
+    return { result: await promise, postCallCount };
+  }
+
+  it.each([
+    ["out of credits", "out_of_credits"],
+    ["without a reason", undefined],
+  ])(
+    "starts a new run when the last one failed (%s)",
+    async (_label, failureReason) => {
+      const { result, postCallCount } = await analyzeWithStates([
+        failedRun(456, failureReason),
+        completedRun(789),
+      ]);
+
+      expect(postCallCount).toBe(1);
+      expect(result).toContain(
+        "Previous analysis (Run ID: 456) failed, starting a new one...",
+      );
+      expect(result).toContain("Analysis started with Run ID: 789");
+      expect(result).toContain("## Analysis Complete");
+      expect(result).not.toContain("## Analysis Failed");
+    },
+  );
+
+  it("keeps the failed run's partial analysis when a restart gets a 402", async () => {
+    const { result, postCallCount } = await analyzeWithStates(
+      [
+        failedRun(456, "out_of_credits", [
+          {
+            id: "block-1",
+            artifacts: [
+              {
+                key: "root_cause",
+                reason: "Root cause analysis completed",
+                data: {
+                  one_line_description: "The request used the wrong bottle ID.",
+                  five_whys: [],
+                  reproduction_steps: [],
+                },
+              },
+            ],
+          },
+        ]),
+      ],
+      () =>
+        HttpResponse.json(
+          {
+            detail:
+              "Your organization does not have enough credits to start an Autofix run.",
+            code: "seer_out_of_credits",
+          },
+          { status: 402 },
+        ),
+    );
+
+    expect(postCallCount).toBe(1);
+    expect(result).toContain("## Analysis Not Started");
+    expect(result).toContain(
+      "Your organization does not have enough credits to start an Autofix run.",
+    );
+    expect(result).toContain(
+      "The previous analysis (Run ID: 456) failed before it finished. Its partial results:",
+    );
+    expect(result).toContain('<seer_analysis run_id="456" step="root_cause">');
+    expect(result).toContain("The request used the wrong bottle ID.");
+  });
+
+  it("explains a run that stopped because the org ran out of credits", async () => {
+    const { result } = await analyzeWithStates(
+      [{ autofix: null }, failedRun(456, "out_of_credits")],
+      () => HttpResponse.json({ run_id: 456 }),
+    );
+
+    expect(result).toContain("## Analysis Failed");
+    expect(result).toContain(
+      "Your organization does not have enough credits to continue your Autofix run. Someone with billing access can adjust Seer spend and auto-reload in Sentry.",
+    );
   });
 
   it("returns unsupported message for metric issues without calling Seer", async () => {
@@ -497,7 +810,7 @@ describe("analyze_issue_with_seer", () => {
     expect(autofixRequests).toBe(0);
     expect(result).toContain("Seer Analysis Not Available");
     expect(result).toContain("metric");
-    expect(result).toContain("search_events");
+    expect(result).toContain("search_metrics");
   });
 
   it("rejects issues outside the active project constraint", async () => {

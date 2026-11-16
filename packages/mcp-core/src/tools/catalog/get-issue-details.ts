@@ -1,50 +1,76 @@
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
 import type { SentryApiService } from "../../api-client";
-import { ApiNotFoundError } from "../../api-client";
+import { ApiClientError, ApiNotFoundError } from "../../api-client";
 import type {
   AutofixRunState,
+  CommitterList,
   DefaultEvent,
   ErrorEvent,
   Event,
   ExternalIssueList,
   Issue,
+  SourceMapDebug,
   Trace,
-  TransactionEvent,
 } from "../../api-client/types";
-import { UserInputError } from "../../errors";
+import { ConfigurationError, UserInputError } from "../../errors";
 import type { CodeLocation } from "../../internal/code-location";
-import type { AIConversationReference } from "../../internal/tool-helpers/ai-conversation-actions";
+import { buildIssueSideQuests } from "../../internal/issue-side-quests";
+import { sideQuestsSchema } from "../../internal/side-quests";
+import {
+  dedupeReplayIds,
+  getMetricAlertContext,
+  getMetricAlertFollowUpCalls,
+  getReplayIdFromEvent,
+  getSeerActionabilityLabel,
+  getSuspectCommit,
+  isPerformanceIssueType,
+  isSupportedEventType,
+  reportUnsupportedEventType,
+} from "../../internal/formatting";
+import {
+  type AIConversationReference,
+  getAIConversationSuggestedActions,
+} from "../../internal/tool-helpers/ai-conversation-actions";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { enhanceNotFoundError } from "../../internal/tool-helpers/enhance-error";
-import { structuredResult } from "../../internal/tool-helpers/results";
-import {
-  dedupeReplayIds,
-  getReplayIdFromEvent,
-  isPerformanceIssueType,
-  getSeerActionabilityLabel,
-  usesSharedFormatterBody,
-} from "../../internal/formatting";
-import {
-  getAutofixArtifactSummaries,
-  getStatusDisplayName,
-} from "../../internal/tool-helpers/seer";
 import {
   assertIssueWithinProjectConstraint,
   formatIssueOutput,
   parseIssueParams,
 } from "../../internal/tool-helpers/issue";
+import { structuredResult } from "../../internal/tool-helpers/results";
+import type { ToolSession } from "../../internal/tool-helpers/tool-call-formatting";
+import {
+  MAX_SUGGESTED_ACTIONS,
+  type SuggestedToolAction,
+  buildSuggestedToolAction,
+  suggestedToolActionSchema,
+} from "../../internal/tool-helpers/suggested-actions";
+import {
+  getAutofixArtifactSummaries,
+  getStatusDisplayName,
+} from "../../internal/tool-helpers/seer";
 import {
   ParamEventId,
   ParamIssueShortId,
   ParamIssueUrl,
   ParamOrganizationSlug,
+  ParamPackageNames,
   ParamRegionUrl,
 } from "../../schema";
-import { logError } from "../../telem/logging";
+import { logError, logIssue } from "../../telem/logging";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { resolveCodeLocation } from "../support/code-location";
+import {
+  buildIssueEventPayload,
+  getEventTimestamp,
+  issueEventSchema,
+} from "../support/issue-event-payload";
+import { maybeFetchSourceMapDebug } from "../support/source-map-debug";
+import { nonEmptyString } from "../support/structured-stacktrace";
+import type { StructuredToolOutput } from "../types";
 
 // mirrors MAX_DISPLAY_REPLAYS in the markdown output
 const MAX_RELATED_REPLAYS = 5;
@@ -57,131 +83,91 @@ const TRACE_ID_PATTERN = /^[0-9a-fA-F]{32}$/;
  *
  * Every field is mapped explicitly rather than spread from an api response, so a passthrough
  * upstream schema cannot leak backend-only fields into the public interface.
- *
- * `event.body` is the one open record: it is whatever Sentry's shared formatter emits
- * for `?llmFormat=json`, and its sections are decided there. Enumerating them here would make
- * this schema a second declaration of that contract, needing a bump every time a section is
- * added on the Sentry side.
  */
 export const getIssueDetailsOutputSchema = z.object({
   issue: z.object({
     shortId: z.string(),
     title: z.string(),
-    culprit: z.string().nullish(),
-    firstSeen: z.string().nullish(),
-    lastSeen: z.string().nullish(),
-    occurrences: z.number().nullish(),
-    usersImpacted: z.number().nullish(),
-    status: z.string().nullish(),
-    substatus: z.string().nullish(),
-    assignedTo: z.string().nullish(),
-    issueType: z.string().nullish(),
-    issueCategory: z.string().nullish(),
-    seerActionability: z.string().nullish(),
-    platform: z.string().nullish(),
-    project: z.string().nullish(),
+    culprit: z.string().nullable(),
+    firstSeen: z.string().nullable(),
+    lastSeen: z.string().nullable(),
+    occurrences: z.number().nullable(),
+    usersImpacted: z.number().nullable(),
+    status: z.string().nullable(),
+    substatus: z.string().nullable(),
+    assignedTo: z.string().nullable(),
+    issueType: z.string().nullable(),
+    issueCategory: z.string().nullable(),
+    seerActionability: z.string().nullable(),
+    platform: z.string().nullable(),
+    project: z.string().nullable(),
     url: z.string(),
-    // metadata fields the markdown surfaces for specific issue types
-    location: z.string().nullish(),
-    queryPattern: z.string().nullish(),
+    // metadata fields that only performance issues carry
+    location: z.string().nullable(),
+    queryPattern: z.string().nullable(),
   }),
-  event: z.object({
-    id: z.string(),
-    type: z.string().nullish(),
-    occurredAt: z.string().nullish(),
-    body: z.record(z.string(), z.unknown()),
-  }),
+  event: issueEventSchema,
   seer: z
     .object({
-      status: z.string().nullish(),
-      rootCause: z.string().nullish(),
-      solution: z.string().nullish(),
+      status: z.string().nullable(),
+      rootCause: z.string().nullable(),
+      solution: z.string().nullable(),
     })
-    .nullish(),
+    .nullable(),
   codeLocation: z
     .object({
-      repository: z.string().nullish(),
-      path: z.string().nullish(),
-      line: z.number().nullish(),
+      repository: z.string().nullable(),
+      path: z.string().nullable(),
+      line: z.number().nullable(),
       url: z.string(),
     })
-    .nullish(),
+    .nullable(),
+  suspectCommit: z
+    .object({
+      id: z.string(),
+      message: z.string().nullable(),
+      author: z.string().nullable(),
+      suspectCommitType: z.string().nullable(),
+    })
+    .nullable(),
   replays: z
     .object({
-      attached: z.string().nullish(),
+      attached: z.string().nullable(),
       related: z.array(z.string()),
       // the full count, since `related` is capped
       relatedCount: z.number(),
     })
-    .nullish(),
+    .nullable(),
   externalIssues: z
     .array(
       z.object({
-        id: z.string(),
-        issueId: z.string(),
         serviceType: z.string(),
         displayName: z.string(),
         webUrl: z.string(),
       }),
     )
-    .nullish(),
+    .nullable(),
   aiConversations: z
     .array(
       z.object({
         conversationId: z.string(),
-        spanId: z.string().nullish(),
+        spanId: z.string().nullable(),
       }),
     )
-    .nullish(),
+    .nullable(),
+  suggestedActions: z.array(suggestedToolActionSchema),
+  sideQuests: sideQuestsSchema,
 });
 
-export type GetIssueDetailsPayload = z.infer<
+export type GetIssueDetailsPayload = z.output<
   typeof getIssueDetailsOutputSchema
 >;
-
-/**
- * Parses the shared formatter's json body. Returns undefined when the caller's org is not on
- * the rollout yet, which is the signal to keep returning markdown: a structured result has to
- * carry the whole answer, and without the body it would not.
- */
-function parseFormattedBody(event: Event): Record<string, unknown> | undefined {
-  // the same event-type gate the markdown path applies: a transaction still needs the local
-  // rendering, which carries the fetched performance trace that the shared body does not
-  if (!usesSharedFormatterBody(event)) {
-    return undefined;
-  }
-  const content = event.formatted?.content;
-  if (!content) {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(content);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 /**
  * The attached replay plus the related ones, derived the way the markdown output derives them.
  * The attached id lives on the event rather than in the related list, so passing that list
  * through alone loses the replay for an issue whose only one is attached.
  */
-/**
- * ``dateCreated`` sits on the shared-formatter event types rather than the base union, and
- * the markdown path normalizes it to ISO. Read it the same way and tolerate a bad value.
- */
-function eventOccurredAt(event: Event): string | null {
-  const raw = "dateCreated" in event ? event.dateCreated : null;
-  if (typeof raw !== "string") {
-    return null;
-  }
-  const parsed = new Date(raw);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
-}
-
 function buildReplays(
   event: Event,
   relatedReplayIds?: string[],
@@ -201,109 +187,241 @@ function buildReplays(
   };
 }
 
+type IssueDetailsArgs = Parameters<typeof formatIssueOutput>[0];
+
+function issueDetailsResult(args: IssueDetailsArgs) {
+  if (args.experimentalMode) {
+    return buildIssueDetailsResult(args);
+  }
+  return formatIssueOutput(args);
+}
+
+function buildIssueDetailsResult(
+  args: IssueDetailsArgs,
+): StructuredToolOutput<GetIssueDetailsPayload> {
+  if (!isSupportedEventType(args.event)) {
+    reportUnsupportedEventType(args);
+  }
+  return structuredResult(buildIssueDetailsPayload(args));
+}
+
 function buildIssueDetailsPayload({
+  packageNames,
   organizationSlug,
   issue,
   event,
-  body,
   apiService,
   autofixState,
+  performanceTrace,
   externalIssues,
   relatedReplayIds,
   aiConversations,
   codeLocation,
-}: {
-  organizationSlug: string;
-  issue: Issue;
-  event: Event;
-  body: Record<string, unknown>;
-  apiService: SentryApiService;
-  autofixState?: AutofixRunState;
-  externalIssues?: ExternalIssueList;
-  relatedReplayIds?: string[];
-  aiConversations?: AIConversationReference[];
-  codeLocation?: CodeLocation;
-}): GetIssueDetailsPayload {
+  committers,
+  sourceMapDebug,
+  experimentalMode,
+  availableToolNames,
+  directToolNames,
+}: IssueDetailsArgs): GetIssueDetailsPayload {
   const autofix = autofixState?.autofix;
   // the run's own artifacts, not the whole state: an AutofixRunState carries every step and
   // would dwarf the rest of the payload
   const summaries = autofix ? getAutofixArtifactSummaries(autofix) : undefined;
   const isPerf = isPerformanceIssueType(issue) && !!issue.metadata;
+  const suspectCommit = getSuspectCommit(committers);
+  const session = {
+    experimentalMode: experimentalMode ?? false,
+    availableToolNames,
+    directToolNames,
+  };
+  const sideQuests = buildIssueSideQuests({ event, sourceMapDebug }, session);
 
   return {
     issue: {
       shortId: issue.shortId,
       // a performance issue's metadata carries the better title, as the markdown path prefers
-      title: (isPerf ? issue.metadata?.title : null) || issue.title,
-      culprit: issue.culprit,
-      firstSeen: issue.firstSeen,
-      lastSeen: issue.lastSeen,
-      occurrences: issue.count == null ? null : Number(issue.count),
-      usersImpacted: issue.userCount == null ? null : Number(issue.userCount),
-      status: issue.status,
-      substatus: issue.substatus,
-      assignedTo:
+      title:
+        (isPerf ? nonEmptyString(issue.metadata?.title) : null) ?? issue.title,
+      culprit: nonEmptyString(issue.culprit),
+      firstSeen: nonEmptyString(issue.firstSeen),
+      lastSeen: nonEmptyString(issue.lastSeen),
+      occurrences: toCount(issue.count),
+      usersImpacted: toCount(issue.userCount),
+      status: nonEmptyString(issue.status),
+      substatus: nonEmptyString(issue.substatus),
+      assignedTo: nonEmptyString(
         typeof issue.assignedTo === "string"
           ? issue.assignedTo
           : issue.assignedTo?.name,
-      issueType: issue.issueType,
-      issueCategory: issue.issueCategory,
+      ),
+      issueType: nonEmptyString(issue.issueType),
+      issueCategory: nonEmptyString(issue.issueCategory),
       seerActionability:
         issue.seerFixabilityScore == null
           ? null
           : getSeerActionabilityLabel(issue.seerFixabilityScore),
-      platform: issue.platform,
-      project: issue.project?.name,
+      platform: nonEmptyString(issue.platform),
+      project: nonEmptyString(issue.project.name),
       url: apiService.getIssueUrl(organizationSlug, issue.shortId),
       // metadata.value is a query pattern only for a performance issue; on an error it is the
       // exception message, so reading it unconditionally would misname the error text
-      location: isPerf ? issue.metadata?.location : null,
-      queryPattern: isPerf ? issue.metadata?.value : null,
+      location: isPerf ? nonEmptyString(issue.metadata?.location) : null,
+      queryPattern: isPerf ? nonEmptyString(issue.metadata?.value) : null,
     },
-    event: {
-      id: event.id,
-      type: typeof event.type === "string" ? event.type : null,
-      occurredAt: eventOccurredAt(event),
-      body,
-    },
+    event: buildIssueEventPayload({ event, performanceTrace, packageNames }),
     seer: autofix
       ? {
-          status: getStatusDisplayName(autofix.status),
-          rootCause: summaries?.rootCause,
-          solution: summaries?.solution,
+          status: nonEmptyString(getStatusDisplayName(autofix.status)),
+          rootCause: nonEmptyString(summaries?.rootCause),
+          solution: nonEmptyString(summaries?.solution),
         }
       : null,
     codeLocation: codeLocation
       ? {
-          repository: codeLocation.repository,
-          path: codeLocation.path,
-          line: codeLocation.line,
+          repository: codeLocation.repository ?? null,
+          path: codeLocation.path ?? null,
+          line: codeLocation.line ?? null,
           url: codeLocation.url,
         }
       : null,
     replays: buildReplays(event, relatedReplayIds),
+    suspectCommit: suspectCommit
+      ? {
+          id: suspectCommit.id,
+          message: nonEmptyString(suspectCommit.message),
+          author: nonEmptyString(suspectCommit.author),
+          suspectCommitType: nonEmptyString(suspectCommit.suspectCommitType),
+        }
+      : null,
     // mapped field by field, not handed through: several upstream schemas are passthrough, and
-    // structuredContent is a product contract rather than a view of the api response
+    // the link's own ids and the Sentry group id are integration plumbing, not follow-up handles
     externalIssues: externalIssues?.length
-      ? externalIssues.map((issue) => ({
-          id: String(issue.id),
-          issueId: String(issue.issueId),
-          serviceType: issue.serviceType,
-          displayName: issue.displayName,
-          webUrl: issue.webUrl,
+      ? externalIssues.map((externalIssue) => ({
+          serviceType: externalIssue.serviceType,
+          displayName: externalIssue.displayName,
+          webUrl: externalIssue.webUrl,
         }))
       : null,
     aiConversations: aiConversations?.length
       ? aiConversations.map((conversation) => ({
           conversationId: conversation.conversationId,
-          spanId: conversation.spanId,
+          spanId: conversation.spanId ?? null,
         }))
       : null,
+    suggestedActions: buildIssueSuggestedActions({
+      organizationSlug,
+      issue,
+      event,
+      apiService,
+      aiConversations,
+      session,
+    }),
+    // omitted, not empty, when there are none
+    ...(sideQuests && { sideQuests }),
   };
+}
+
+function toCount(value: unknown): number | null {
+  if (value == null || value === "") {
+    return null;
+  }
+  const count = Number(value);
+  return Number.isFinite(count) ? count : null;
+}
+
+/**
+ * The follow-up calls the markdown Response Notes describe, as callable actions: a metric
+ * issue's monitor and query, the agent conversations in the trace, the trace itself, and the
+ * breadcrumbs.
+ */
+function buildIssueSuggestedActions({
+  organizationSlug,
+  issue,
+  event,
+  apiService,
+  aiConversations,
+  session,
+}: {
+  organizationSlug: string;
+  issue: Issue;
+  event: Event;
+  apiService: SentryApiService;
+  aiConversations?: AIConversationReference[];
+  session: ToolSession;
+}): SuggestedToolAction[] {
+  const candidates: Array<SuggestedToolAction | null> = [];
+  const metricAlertContext = getMetricAlertContext(event);
+
+  if (metricAlertContext) {
+    const calls = getMetricAlertFollowUpCalls({
+      organizationSlug,
+      issue,
+      event,
+      context: metricAlertContext,
+    });
+    if (calls.monitor) {
+      candidates.push(
+        buildSuggestedToolAction({
+          ...calls.monitor,
+          reason: "Inspect the Metric Monitor and its connected Alerts.",
+          ...session,
+        }),
+      );
+    }
+    if (calls.search) {
+      candidates.push(
+        buildSuggestedToolAction({
+          toolName: calls.search.toolName,
+          arguments: calls.search.arguments,
+          reason: `Search the data the monitor query matched; focus on ${calls.search.window.start.toISOString()} to ${calls.search.window.end.toISOString()}.`,
+          ...session,
+        }),
+      );
+    }
+  }
+
+  if (aiConversations?.length) {
+    candidates.push(
+      ...getAIConversationSuggestedActions({
+        organizationSlug,
+        aiConversations,
+        ...session,
+      }),
+    );
+  }
+
+  // a metric issue's trace belongs to the monitor evaluation, not the data that breached
+  const traceId = getEventTraceId(event);
+  if (traceId && TRACE_ID_PATTERN.test(traceId) && !metricAlertContext) {
+    candidates.push(
+      buildSuggestedToolAction({
+        toolName: "get_trace_details",
+        arguments: { organizationSlug, traceId },
+        reason: "Inspect the distributed trace this event belongs to.",
+        ...session,
+      }),
+    );
+  }
+
+  candidates.push(
+    buildSuggestedToolAction({
+      toolName: "get_issue_breadcrumbs",
+      arguments: {
+        issueUrl: apiService.getIssueUrl(organizationSlug, issue.shortId),
+      },
+      reason: "Read the breadcrumb trail leading up to this event.",
+      ...session,
+    }),
+  );
+
+  return candidates
+    .filter((action): action is SuggestedToolAction => action !== null)
+    .slice(0, MAX_SUGGESTED_ACTIONS);
 }
 
 export default defineTool({
   name: "get_issue_details",
+  title: "Get Issue Details",
   skills: ["inspect", "triage", "seer"], // Available in inspect, triage, and seer skills
   requiredScopes: ["event:read"],
   description: [
@@ -313,6 +431,8 @@ export default defineTool({
     "- Provide a specific issue ID (e.g., 'CLOUDFLARE-MCP-41', 'PROJECT-123')",
     "- Ask to 'explain [ISSUE-ID]', 'tell me about [ISSUE-ID]'",
     "- Want details/stacktrace/analysis for a known issue",
+    "- Need installed package versions for an exact event (pass eventId and packageNames)",
+    "- Want the suspect commit's SHA, message, author, and source when available",
     "- Provide a Sentry issue URL",
     "",
     "DO NOT USE for:",
@@ -344,6 +464,7 @@ export default defineTool({
     "- **IMPORTANT**: If user provides a Sentry URL, pass the ENTIRE URL to issueUrl parameter unchanged",
     "- When using issueUrl, all other parameters are automatically extracted - don't provide them separately",
     "- If using issueId (not URL), then organizationSlug is required",
+    "- To close the issue from a commit, put `Fixes <issue.shortId>` in the commit message, or `Fixes <issue.url>` when shortId is only digits",
     "</hints>",
   ].join("\n"),
   inputSchema: {
@@ -352,17 +473,22 @@ export default defineTool({
     issueId: ParamIssueShortId.optional(),
     eventId: ParamEventId.optional(),
     issueUrl: ParamIssueUrl.optional(),
+    packageNames: ParamPackageNames.optional(),
   },
-  // outputSchema is deliberately not declared yet. tools/list would export it immediately,
-  // while an org that is not on sentry's formatter rollout still gets a markdown result with
-  // no structuredContent -- advertising a schema that some success paths cannot satisfy. Wire
-  // it up once the rollout guarantees a json body on every event.
+  // Experimental sessions get structuredContent on every success path, so only they are told
+  // the schema; stable sessions still get markdown until the structured payload graduates.
+  experimentalOutputSchema: getIssueDetailsOutputSchema,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
     openWorldHint: true,
   },
   async handler(params, context: ServerContext) {
+    if (params.packageNames && !params.eventId) {
+      throw new UserInputError(
+        "`packageNames` requires an explicit `eventId`.",
+      );
+    }
     const apiService = apiServiceFromContext(context, {
       regionUrl: params.regionUrl ?? undefined,
     });
@@ -376,7 +502,7 @@ export default defineTool({
         );
       }
 
-      setOrganizationContext(orgSlug);
+      setTargetTagsAndAttributes({ organizationSlug: orgSlug });
       // Use issueId directly if provided (e.g., from URL parsing), otherwise search by eventId
       let issue: Awaited<ReturnType<typeof apiService.getIssue>>;
       if (params.issueId) {
@@ -385,10 +511,11 @@ export default defineTool({
           issueId: params.issueId,
         });
       } else {
-        const [found] = await apiService.listIssues({
+        const issues = await apiService.listIssues({
           organizationSlug: orgSlug,
           query: eventId,
         });
+        const found = issues.at(0);
         if (!found) {
           throw new UserInputError(`No issue found for Event ID: ${eventId}`);
         }
@@ -400,7 +527,14 @@ export default defineTool({
       });
       // For this call, we might want to provide context if it fails
       const [
-        { event, performanceTrace, aiConversations, codeLocation },
+        {
+          event,
+          performanceTrace,
+          aiConversations,
+          codeLocation,
+          committers,
+          sourceMapDebug,
+        },
         { autofixState, externalIssues, relatedReplayIds },
       ] = await Promise.all([
         apiService
@@ -437,27 +571,8 @@ export default defineTool({
         }),
       ]);
 
-      const body = parseFormattedBody(event);
-      if (body) {
-        return structuredResult(
-          buildIssueDetailsPayload({
-            organizationSlug: orgSlug,
-            issue,
-            event,
-            body,
-            apiService,
-            autofixState,
-            externalIssues,
-            relatedReplayIds,
-            aiConversations,
-            codeLocation,
-          }),
-        );
-      }
-
-      // no shared-formatter body for this org yet: keep returning markdown rather than a
-      // structured result that is missing the event itself
-      return formatIssueOutput({
+      return issueDetailsResult({
+        packageNames: params.packageNames,
         organizationSlug: orgSlug,
         issue,
         event,
@@ -468,6 +583,8 @@ export default defineTool({
         relatedReplayIds,
         aiConversations,
         codeLocation,
+        committers,
+        sourceMapDebug,
         experimentalMode: context.experimentalMode,
         availableToolNames: context.availableToolNames,
         directToolNames: context.directToolNames,
@@ -494,14 +611,14 @@ export default defineTool({
         issueUrl: params.issueUrl,
       });
 
-    setOrganizationContext(orgSlug);
+    setTargetTagsAndAttributes({ organizationSlug: orgSlug });
 
     // For the main issue lookup, provide parameter context on 404
     let issue: Awaited<ReturnType<typeof apiService.getIssue>>;
     try {
       issue = await apiService.getIssue({
         organizationSlug: orgSlug,
-        issueId: parsedIssueId!,
+        issueId: parsedIssueId,
       });
     } catch (error) {
       if (error instanceof ApiNotFoundError) {
@@ -518,7 +635,14 @@ export default defineTool({
     });
 
     const [
-      { event, performanceTrace, aiConversations, codeLocation },
+      {
+        event,
+        performanceTrace,
+        aiConversations,
+        codeLocation,
+        committers,
+        sourceMapDebug,
+      },
       { autofixState, externalIssues, relatedReplayIds },
     ] = await Promise.all([
       apiService
@@ -543,27 +667,7 @@ export default defineTool({
       }),
     ]);
 
-    const body = parseFormattedBody(event);
-    if (body) {
-      return structuredResult(
-        buildIssueDetailsPayload({
-          organizationSlug: orgSlug,
-          issue,
-          event,
-          body,
-          apiService,
-          autofixState,
-          externalIssues,
-          relatedReplayIds,
-          aiConversations,
-          codeLocation,
-        }),
-      );
-    }
-
-    // no shared-formatter body for this org yet: keep returning markdown rather than a
-    // structured result that is missing the event itself
-    return formatIssueOutput({
+    return issueDetailsResult({
       organizationSlug: orgSlug,
       issue,
       event,
@@ -574,6 +678,8 @@ export default defineTool({
       relatedReplayIds,
       aiConversations,
       codeLocation,
+      committers,
+      sourceMapDebug,
       experimentalMode: context.experimentalMode,
       availableToolNames: context.availableToolNames,
       directToolNames: context.directToolNames,
@@ -595,8 +701,16 @@ async function fetchEventEnrichment({
   performanceTrace: Trace | undefined;
   aiConversations: AIConversationReference[];
   codeLocation: CodeLocation | undefined;
+  committers: CommitterList | undefined;
+  sourceMapDebug: SourceMapDebug | undefined;
 }> {
-  const [performanceTrace, aiConversations, codeLocation] = await Promise.all([
+  const [
+    performanceTrace,
+    aiConversations,
+    codeLocation,
+    committers,
+    sourceMapDebug,
+  ] = await Promise.all([
     maybeFetchPerformanceTrace({
       apiService,
       organizationSlug,
@@ -613,9 +727,61 @@ async function fetchEventEnrichment({
       projectSlug: issue.project.slug,
       event,
     }),
+    maybeFetchCommitters({
+      apiService,
+      organizationSlug,
+      projectSlug: issue.project.slug,
+      event,
+    }),
+    maybeFetchSourceMapDebug({
+      apiService,
+      organizationSlug,
+      projectSlug: issue.project.slug,
+      event,
+    }),
   ]);
 
-  return { performanceTrace, aiConversations, codeLocation };
+  return {
+    performanceTrace,
+    aiConversations,
+    codeLocation,
+    committers,
+    sourceMapDebug,
+  };
+}
+
+/** Keeps issue details available when optional commit lookup fails, reporting unexpected failures. */
+async function maybeFetchCommitters({
+  apiService,
+  organizationSlug,
+  projectSlug,
+  event,
+}: {
+  apiService: SentryApiService;
+  organizationSlug: string;
+  projectSlug: string;
+  event: Event;
+}): Promise<CommitterList | undefined> {
+  try {
+    return await apiService.getEventCommitters({
+      organizationSlug,
+      projectSlug,
+      eventId: event.id,
+    });
+  } catch (error) {
+    if (
+      !(error instanceof ApiClientError) &&
+      !(error instanceof ConfigurationError)
+    ) {
+      logIssue(error, {
+        loggerScope: ["tools", "get-issue-details", "committers"],
+        contexts: {
+          request: { organizationSlug, projectSlug, eventId: event.id },
+        },
+      });
+    }
+    return undefined;
+  }
 }
 
 /**
@@ -690,7 +856,7 @@ async function maybeFetchAutofixState({
     return undefined;
   }
 
-  return apiService
+  return await apiService
     .getAutofixState({ organizationSlug, issueId: String(issue.id) })
     .catch(() => undefined);
 }
@@ -825,18 +991,6 @@ function buildConversationLookupTimeParams(event: Event): {
   };
 }
 
-function getEventTimestamp(event: Event): Date | null {
-  const timestamp =
-    getString((event as { dateCreated?: unknown }).dateCreated) ??
-    getString(event.dateReceived);
-  if (!timestamp) {
-    return null;
-  }
-
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
 function getEventTraceId(event: Event): string | undefined {
   const traceId = event.contexts?.trace?.trace_id;
   return getString(traceId);
@@ -849,10 +1003,6 @@ function getString(value: unknown): string | undefined {
 function isErrorEvent(event: Event): event is ErrorEvent | DefaultEvent {
   // "default" type represents error events without exception data
   return event.type === "error" || event.type === "default";
-}
-
-function isTransactionEvent(event: Event): event is TransactionEvent {
-  return event.type === "transaction";
 }
 
 function shouldFetchTraceForEvent(event: Event): { traceId: string } | null {

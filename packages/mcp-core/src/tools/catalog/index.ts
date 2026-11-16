@@ -9,6 +9,8 @@ import findDashboards from "./find-dashboards";
 import getDashboardDetails from "./get-dashboard-details";
 import findMonitors from "./find-monitors";
 import getMonitorDetails from "./get-monitor-details";
+import createMonitor from "./create-monitor";
+import deleteMonitorEnvironment from "./delete-monitor-environment";
 import findUptimeMonitors from "./find-uptime-monitors";
 import getUptimeMonitorDetails from "./get-uptime-monitor-details";
 import findMetricMonitors from "./find-metric-monitors";
@@ -36,7 +38,16 @@ import getSpanDetails from "./get-span-details";
 import getReplayDetails from "./get-replay-details";
 import getEventAttachment from "./get-event-attachment";
 import updateIssue from "./update-issue";
+import linkIssue from "./link-issue";
+import unlinkIssue from "./unlink-issue";
 import searchEvents from "./search-events";
+import searchErrors from "./search-errors";
+import searchLogs from "./search-logs";
+import searchTraces from "./search-traces";
+import searchMetrics from "./search-metrics";
+import searchProfiles from "./search-profiles";
+import searchReplays from "./search-replays";
+import findDroppedEvents from "./find-dropped-events";
 import createTeam from "./create-team";
 import createProject from "./create-project";
 import updateProject from "./update-project";
@@ -60,12 +71,17 @@ import getAgentConversationDetails from "./get-agent-conversation-details";
 import searchAgentConversations from "./search-agent-conversations";
 import addIssueNote from "./add-issue-note";
 import onboardingStatusUpdate from "./onboarding-status-update";
+import searchAttributes from "./search-attributes";
+import submitFeedbackToSentryTeam from "./submit-feedback-to-sentry-team";
+import { withFreshReadInput } from "../../internal/fresh-reads";
 import type { ToolConfig } from "../types";
 
 const legacyGetAIConversationDetails = {
   ...getAgentConversationDetails,
   name: "get_ai_conversation_details",
+  title: "Get AI Conversation Details (Deprecated)",
   includeInSkillDefinitions: false,
+  deprecated: { replacedBy: ["get_agent_conversation_details"] },
   description: [
     "Deprecated alias for get_agent_conversation_details.",
     "",
@@ -76,13 +92,35 @@ const legacyGetAIConversationDetails = {
 const legacySearchAIConversations = {
   ...searchAgentConversations,
   name: "search_ai_conversations",
+  title: "Search AI Conversations (Deprecated)",
   includeInSkillDefinitions: false,
+  deprecated: { replacedBy: ["search_agent_conversations"] },
   description: [
     "Deprecated alias for search_agent_conversations.",
     "",
     "Use search_agent_conversations for new integrations. This alias is kept for backward compatibility.",
   ].join("\n"),
 } satisfies ToolConfig<any>;
+
+// The docs tools read docs.sentry.io, not the Sentry API, so they have no
+// cached reads to bypass.
+const DOCS_TOOL_NAMES = new Set(["search_docs", "get_doc"]);
+
+/** Give every read tool that calls the Sentry API the shared `fresh` input. */
+function withFreshReadInputs<T extends Record<string, ToolConfig<any>>>(
+  tools: T,
+): T {
+  return Object.fromEntries(
+    Object.entries(tools).map(([key, tool]) => [
+      key,
+      tool.annotations.readOnlyHint &&
+      tool.annotations.openWorldHint &&
+      !DOCS_TOOL_NAMES.has(tool.name)
+        ? withFreshReadInput(tool)
+        : tool,
+    ]),
+  ) as T;
+}
 
 /**
  * Catalog of ordinary Sentry MCP operations.
@@ -93,7 +131,7 @@ const legacySearchAIConversations = {
  * Wrapper tools such as search_sentry_tools and execute_sentry_tool intentionally
  * live outside this catalog.
  */
-const catalogTools = {
+const catalogTools = withFreshReadInputs({
   whoami,
   find_organizations: findOrganizations,
   find_teams: findTeams,
@@ -104,6 +142,8 @@ const catalogTools = {
   get_dashboard_details: getDashboardDetails,
   find_monitors: findMonitors,
   get_monitor_details: getMonitorDetails,
+  create_monitor: createMonitor,
+  delete_monitor_environment: deleteMonitorEnvironment,
   find_uptime_monitors: findUptimeMonitors,
   get_uptime_monitor_details: getUptimeMonitorDetails,
   find_metric_monitors: findMetricMonitors,
@@ -131,6 +171,15 @@ const catalogTools = {
   get_replay_details: getReplayDetails,
   get_event_attachment: getEventAttachment,
   update_issue: updateIssue,
+  link_issue: linkIssue,
+  unlink_issue: unlinkIssue,
+  search_attributes: searchAttributes,
+  search_errors: searchErrors,
+  search_logs: searchLogs,
+  search_traces: searchTraces,
+  search_metrics: searchMetrics,
+  search_profiles: searchProfiles,
+  search_replays: searchReplays,
   search_events: searchEvents,
   create_team: createTeam,
   create_project: createProject,
@@ -145,6 +194,7 @@ const catalogTools = {
   get_doc: getDoc,
   search_issues: searchIssues,
   search_issue_events: searchIssueEvents,
+  find_dropped_events: findDroppedEvents,
   get_profile: getProfile,
   get_profile_details: getProfileDetails,
   get_sentry_mcp_info: getSentryMcpInfo,
@@ -158,7 +208,8 @@ const catalogTools = {
   search_ai_conversations: legacySearchAIConversations,
   add_issue_note: addIssueNote,
   onboarding_status_update: onboardingStatusUpdate,
-} as const satisfies Record<string, ToolConfig<any>>;
+  submit_feedback_to_sentry_team: submitFeedbackToSentryTeam,
+} as const satisfies Record<string, ToolConfig<any>>);
 
 export default catalogTools;
 export type CatalogToolName = keyof typeof catalogTools;

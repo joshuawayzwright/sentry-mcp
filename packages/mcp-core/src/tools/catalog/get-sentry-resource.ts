@@ -1,6 +1,5 @@
-import { getActiveSpan, setTag } from "@sentry/core";
+import { getActiveSpan, setAttributes, setTags } from "@sentry/core";
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
 import type { SentryApiService } from "../../api-client";
 import { UserInputError } from "../../errors";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
@@ -14,10 +13,16 @@ import {
   resolveScopedOrganizationSlug,
   resolveScopedProjectSlug,
 } from "../../internal/url-scope";
-import { ParamOrganizationSlug } from "../../schema";
+import {
+  ParamEventId,
+  ParamOrganizationSlug,
+  ParamPackageNames,
+} from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { isNumericId } from "../../utils/slug-validation";
 import getAIConversationDetails from "./get-agent-conversation-details";
+import getDashboardDetails from "./get-dashboard-details";
 import getIssueDetails from "./get-issue-details";
 import getMonitorDetails from "./get-monitor-details";
 import getProfileDetails from "./get-profile-details";
@@ -36,6 +41,7 @@ export const FULLY_SUPPORTED_TYPES = [
   "replay",
   "monitor",
   "snapshot",
+  "dashboard",
 ] as const;
 export type FullySupportedType = (typeof FULLY_SUPPORTED_TYPES)[number];
 
@@ -75,6 +81,48 @@ export interface ResolvedResourceParams {
   // Snapshot params
   snapshotId?: string;
   selectedSnapshot?: string;
+  // Dashboard params
+  dashboardIdOrTitle?: string;
+}
+
+// Issue short IDs (PROJECT-123) and numeric issue IDs. Only used to infer a
+// missing resourceType, so other resource IDs keep requiring an explicit type.
+const ISSUE_ID_PATTERN = /^(?:\d+|[A-Z0-9_.]+(?:-[A-Z0-9_.]+)*-[A-Z0-9]+)$/;
+
+// Sentry pages that are lists or searches rather than one resource.
+const UNSUPPORTED_URL_GUIDANCE: Array<[RegExp, string]> = [
+  [
+    /(^|\/)api\/0\//,
+    "This is a Sentry API URL. Pass the Sentry web URL for the resource instead, or use `resourceType` with `resourceId`.",
+  ],
+  [
+    /(^|\/)issues\/?$/,
+    "This is an issue list URL, not a single issue. Use `search_issues` to list issues, or pass a URL for one issue such as https://my-org.sentry.io/issues/PROJECT-123/.",
+  ],
+  [
+    /(^|\/)alerts\//,
+    "Alert URLs are not supported here. Use `find_alert_rules` to list alert rules, or `get_alert_rule` for one rule.",
+  ],
+  [
+    /(^|\/)explore\/logs\/?$/,
+    "This is a logs search URL. Use `search_logs` to query logs.",
+  ],
+  [
+    /(^|\/)(explore\/traces|performance|traces)\/?$/,
+    "This is a trace search URL. Use `search_traces` to query traces, or pass a URL for one trace.",
+  ],
+];
+
+function getUnsupportedUrlGuidance(url: string): string | undefined {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname.replace(/^\/+|\/+$/g, "");
+  } catch {
+    return undefined;
+  }
+  return UNSUPPORTED_URL_GUIDANCE.find(([pattern]) =>
+    pattern.test(pathname),
+  )?.[1];
 }
 
 export function resolveResourceParams(params: {
@@ -86,10 +134,13 @@ export function resolveResourceParams(params: {
 }): ResolvedResourceParams {
   if (params.url) {
     const parsed = parseSentryUrl(params.url);
-    return resolveFromParsedUrl(parsed, params);
+    return resolveFromParsedUrl(parsed, { ...params, url: params.url });
   }
 
   if (!params.resourceType) {
+    if (params.resourceId && ISSUE_ID_PATTERN.test(params.resourceId)) {
+      return resolveResourceParams({ ...params, resourceType: "issue" });
+    }
     throw new UserInputError(
       "Either `url` or `resourceType` must be provided. " +
         "Pass a `url` to auto-detect the resource type, or specify `resourceType` with `resourceId`.",
@@ -170,6 +221,13 @@ export function resolveResourceParams(params: {
         organizationSlug,
         snapshotId: resourceId,
       };
+
+    case "dashboard":
+      return {
+        type: "dashboard",
+        organizationSlug,
+        dashboardIdOrTitle: resourceId,
+      };
   }
 }
 
@@ -180,6 +238,7 @@ export function resolveResourceParams(params: {
 function resolveFromParsedUrl(
   parsed: ParsedSentryUrl,
   params: {
+    url: string;
     resourceType?: string | null;
     organizationSlug?: string | null;
     projectSlug?: string | null;
@@ -196,12 +255,16 @@ function resolveFromParsedUrl(
   if (detectedType === "unknown") {
     if (parsed.transaction) {
       throw new UserInputError(
-        `Detected a performance summary URL for transaction "${parsed.transaction}". Use \`search_events\` to find traces and performance data for this transaction.`,
+        `Detected a performance summary URL for transaction "${parsed.transaction}". Use \`search_traces\` to find traces and performance data for this transaction.`,
       );
+    }
+    const guidance = getUnsupportedUrlGuidance(params.url);
+    if (guidance) {
+      throw new UserInputError(guidance);
     }
     throw new UserInputError(
       "Could not determine resource type from URL. " +
-        "Supported URL patterns: issues, events, traces, agent conversations, profiles, replays, monitors, and releases.",
+        "Supported URL patterns: issues, events, traces, agent conversations, profiles, replays, monitors, dashboards, and releases.",
     );
   }
 
@@ -233,10 +296,8 @@ function resolveFromParsedUrl(
       };
 
     case "event":
-      if (!parsed.issueId || !parsed.eventId) {
-        throw new UserInputError(
-          "Could not extract issue ID and event ID from URL.",
-        );
+      if (!parsed.eventId) {
+        throw new UserInputError("Could not extract event ID from URL.");
       }
       return {
         type: "event",
@@ -352,6 +413,16 @@ function resolveFromParsedUrl(
         snapshotId: parsed.snapshotId,
         selectedSnapshot: parsed.selectedSnapshot,
       };
+
+    case "dashboard":
+      if (!parsed.dashboardId) {
+        throw new UserInputError("Could not extract dashboard ID from URL.");
+      }
+      return {
+        type: "dashboard",
+        organizationSlug,
+        dashboardIdOrTitle: parsed.dashboardId,
+      };
   }
 }
 
@@ -420,6 +491,7 @@ function generateUnsupportedResourceMessage(
 
 export default defineTool({
   name: "get_sentry_resource",
+  title: "Get Sentry Resource",
   skills: ["inspect", "triage", "seer"],
   requiredScopes: ["event:read", "project:read"],
 
@@ -428,12 +500,20 @@ export default defineTool({
       "get_monitor_details",
       availableToolNames,
     );
+    // Monitors and dashboards both delegate to inspect-only catalog tools.
+    // Only advertise them when their backing tools are available in this session.
+    // The URL parser still recognises /crons/ and /dashboard/{id}/ unconditionally;
+    // non-inspect sessions get a clear "requires the inspect skill" error at runtime.
+    const dashboardResourcesAvailable = isToolAvailable(
+      "get_dashboard_details",
+      availableToolNames,
+    );
     const fullResolutionInstruction = formatToolCallInstruction({
       toolName: "get_snapshot_image",
       arguments: {
-        organizationSlug: "<organization_slug>",
-        snapshotId: "<snapshot_id>",
-        imageIdentifier: "<image_file_name>",
+        organizationSlug: "<organizationSlug>",
+        snapshotId: "<snapshotId>",
+        imageIdentifier: "<imageFileName>",
         imageResolution: "full",
       },
       experimentalMode,
@@ -443,26 +523,35 @@ export default defineTool({
         "Full-resolution snapshot image bytes are not available in this session",
       purpose: "for full-resolution image bytes",
     });
-    const supportedResources = monitorResourcesAvailable
-      ? "issues, events, traces, spans, agent conversations, replays, monitors, preprod snapshots, and snapshot images."
-      : "issues, events, traces, spans, agent conversations, replays, preprod snapshots, and snapshot images.";
+    const extraResources = [
+      ...(monitorResourcesAvailable ? ["monitors"] : []),
+      ...(dashboardResourcesAvailable ? ["dashboards"] : []),
+    ];
+    const supportedResources =
+      extraResources.length > 0
+        ? `issues, events, traces, spans, agent conversations, replays, ${extraResources.join(", ")}, preprod snapshots, and snapshot images.`
+        : "issues, events, traces, spans, agent conversations, replays, preprod snapshots, and snapshot images.";
     const resourceIds = [
       ...(monitorResourcesAvailable ? ["- monitor: <monitorSlug>"] : []),
+      ...(dashboardResourcesAvailable
+        ? ["- dashboard: <dashboardId or title>"]
+        : []),
       "- snapshot: <snapshotId>",
     ];
 
     return [
       "Fetch a Sentry resource by URL, or by resourceType plus resourceId.",
-      "Pass a Sentry URL directly when possible; the resource type is auto-detected.",
+      "Use it when the user shares a Sentry link. Pass the URL directly when possible; the resource type is auto-detected.",
       "",
       `Supports ${supportedResources}`,
       "Trace lookups return a condensed overview by default.",
+      "For installed package versions recorded with an exact event, pass packageNames with an event URL or resourceType='event'.",
       "",
       "Agent Conversations: A conversation is a set of spans sharing the same gen_ai.conversation.id. Use resourceType='ai_conversation' with a conversation ID, or pass a Sentry conversation URL, to fetch the transcript/details. To discover or list conversations, use search_agent_conversations. Conversations are NOT issues — do not use search_issues for conversation queries.",
       "",
       "For preprod snapshot URLs (matching 'sentry.io/preprod/snapshots/'):",
       "- Without ?selectedSnapshot=: returns the snapshot diff summary (changed, added, removed images)",
-      `- With ?selectedSnapshot=<image_file_name>: returns the image preview and metadata. ${fullResolutionInstruction}.`,
+      `- With ?selectedSnapshot=<imageFileName>: returns the image preview and metadata. ${fullResolutionInstruction}.`,
       "",
       "Resource IDs:",
       ...resourceIds,
@@ -471,6 +560,11 @@ export default defineTool({
       "get_sentry_resource(url='https://sentry.io/issues/PROJECT-123/')",
       "get_sentry_resource(resourceType='issue', organizationSlug='my-org', resourceId='PROJECT-123')",
       "get_sentry_resource(resourceType='ai_conversation', organizationSlug='my-org', resourceId='conversation-123')",
+      ...(dashboardResourcesAvailable
+        ? [
+            "get_sentry_resource(url='https://sentry.sentry.io/dashboard/542438/')",
+          ]
+        : []),
       "get_sentry_resource(url='https://sentry.sentry.io/preprod/snapshots/123/')",
       "get_sentry_resource(url='https://sentry.sentry.io/preprod/snapshots/123/?selectedSnapshot=login_screen.png')",
       "</examples>",
@@ -495,10 +589,11 @@ export default defineTool({
         "replay",
         "monitor",
         "snapshot",
+        "dashboard",
       ])
       .optional()
       .describe(
-        "Resource type. With a URL, can override a span-focused trace URL with `trace`. Use `monitor` with a monitor slug only when inspect monitor tools are available or `snapshot` with a snapshot artifact ID.",
+        "Resource type. With a URL, can override a span-focused trace URL with `trace`. Use `monitor` with a monitor slug only when inspect monitor tools are available, `snapshot` with a snapshot artifact ID, or `dashboard` with a dashboard ID or exact title when inspect dashboard tools are available.",
       ),
 
     resourceId: z
@@ -506,10 +601,18 @@ export default defineTool({
       .trim()
       .optional()
       .describe(
-        "Resource identifier: issue shortId (e.g., 'PROJECT-123'), event ID, trace ID, agent conversation ID, replay ID, monitor slug when inspect monitor tools are available, or snapshot artifact ID. Required when not using a URL.",
+        "Resource identifier: issue shortId (e.g., 'PROJECT-123'), event ID, trace ID, agent conversation ID, replay ID, monitor slug when inspect monitor tools are available, dashboard ID or title when inspect dashboard tools are available, or snapshot artifact ID. Required when not using a URL.",
       ),
 
     organizationSlug: ParamOrganizationSlug.optional(),
+    packageNames: ParamPackageNames.optional(),
+
+    // Undocumented aliases for keys models often send instead of
+    // url/resourceId. Kept without descriptions to keep the schema small.
+    issueUrl: z.string().trim().optional(),
+    resourceUrl: z.string().trim().optional(),
+    issueId: z.string().trim().optional(),
+    id: z.string().trim().optional(),
   },
 
   annotations: {
@@ -519,20 +622,34 @@ export default defineTool({
   },
 
   async handler(params, context: ServerContext) {
+    const url = params.url ?? params.issueUrl ?? params.resourceUrl;
     const resolved = resolveResourceParams({
-      url: params.url,
-      resourceType: params.resourceType,
-      resourceId: params.resourceId,
+      url,
+      resourceType:
+        params.resourceType ?? (!url && params.issueId ? "issue" : undefined),
+      resourceId: params.resourceId ?? params.issueId ?? params.id,
       organizationSlug:
         params.organizationSlug ?? context.constraints.organizationSlug,
       projectSlug: context.constraints.projectSlug,
     });
 
-    setTag("resource.type", resolved.type);
-    setOrganizationContext(resolved.organizationSlug);
-    if (resolved.spanId) {
-      setTag("trace.span_id", resolved.spanId);
+    if (
+      params.packageNames &&
+      (resolved.type !== "event" ||
+        !ParamEventId.safeParse(resolved.eventId).success)
+    ) {
+      throw new UserInputError(
+        "`packageNames` requires an event URL or resourceType='event' with a 32-character hexadecimal event ID.",
+      );
     }
+
+    const resourceContext = { "resource.type": resolved.type };
+    setTags(resourceContext);
+    setAttributes(resourceContext);
+    setTargetTagsAndAttributes({
+      organizationSlug: resolved.organizationSlug,
+      spanId: resolved.spanId,
+    });
 
     getActiveSpan()?.setAttribute("app.resource.type", resolved.type);
 
@@ -552,7 +669,7 @@ export default defineTool({
 
     switch (resolved.type) {
       case "issue":
-        return getIssueDetails.handler(
+        return await getIssueDetails.handler(
           {
             organizationSlug: resolved.organizationSlug,
             issueId: resolved.issueId,
@@ -562,8 +679,9 @@ export default defineTool({
         );
 
       case "event":
-        return getIssueDetails.handler(
+        return await getIssueDetails.handler(
           {
+            packageNames: params.packageNames,
             organizationSlug: resolved.organizationSlug,
             issueId: resolved.issueId,
             eventId: resolved.eventId,
@@ -573,7 +691,7 @@ export default defineTool({
         );
 
       case "trace":
-        return getTraceDetails.handler(
+        return await getTraceDetails.handler(
           {
             organizationSlug: resolved.organizationSlug,
             traceId: resolved.traceId!,
@@ -583,7 +701,7 @@ export default defineTool({
         );
 
       case "span":
-        return getSpanDetails.handler(
+        return await getSpanDetails.handler(
           {
             organizationSlug: resolved.organizationSlug,
             traceId: resolved.traceId!,
@@ -594,7 +712,7 @@ export default defineTool({
         );
 
       case "ai_conversation":
-        return getAIConversationDetails.handler(
+        return await getAIConversationDetails.handler(
           {
             organizationSlug: resolved.organizationSlug,
             conversationId: resolved.conversationId!,
@@ -607,9 +725,9 @@ export default defineTool({
         );
 
       case "replay":
-        return getReplayDetails.handler(
+        return await getReplayDetails.handler(
           {
-            replayUrl: params.url,
+            replayUrl: url,
             organizationSlug: resolved.organizationSlug,
             replayId: resolved.replayId,
             regionUrl: context.constraints.regionUrl ?? undefined,
@@ -619,7 +737,7 @@ export default defineTool({
 
       case "monitor":
         assertCatalogToolAvailable(context, "get_monitor_details", "Monitor");
-        return getMonitorDetails.handler(
+        return await getMonitorDetails.handler(
           {
             organizationSlug: resolved.organizationSlug,
             projectSlugOrId: resolved.projectSlugOrId ?? null,
@@ -637,9 +755,9 @@ export default defineTool({
         );
 
       case "profile":
-        return getProfileDetails.handler(
+        return await getProfileDetails.handler(
           {
-            profileUrl: params.url,
+            profileUrl: url,
             organizationSlug: resolved.organizationSlug,
             projectSlugOrId: resolved.projectSlugOrId,
             profileId: resolved.profileId,
@@ -652,9 +770,24 @@ export default defineTool({
           context,
         );
 
+      case "dashboard":
+        assertCatalogToolAvailable(
+          context,
+          "get_dashboard_details",
+          "Dashboard",
+        );
+        return await getDashboardDetails.handler(
+          {
+            organizationSlug: resolved.organizationSlug,
+            dashboardIdOrTitle: resolved.dashboardIdOrTitle!,
+            regionUrl: context.constraints.regionUrl ?? null,
+          },
+          context,
+        );
+
       case "snapshot":
         if (resolved.selectedSnapshot) {
-          return getSnapshotImage.handler(
+          return await getSnapshotImage.handler(
             {
               organizationSlug: resolved.organizationSlug,
               snapshotId: resolved.snapshotId!,
@@ -666,7 +799,7 @@ export default defineTool({
           );
         }
 
-        return getSnapshot.handler(
+        return await getSnapshot.handler(
           {
             organizationSlug: resolved.organizationSlug,
             snapshotId: resolved.snapshotId!,

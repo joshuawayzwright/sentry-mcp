@@ -1,3 +1,8 @@
+import {
+  METRIC_MONITOR_DATASETS,
+  METRIC_MONITOR_PRIORITY,
+  METRIC_MONITOR_THRESHOLD_TYPES,
+} from "@sentry/toolkit-core/metric-monitor";
 import { z } from "zod";
 import type { Detector, MetricMonitorUpdate } from "../../api-client/types";
 import { UserInputError } from "../../errors";
@@ -8,29 +13,24 @@ import {
 } from "./detector-details";
 
 const metricConditionSchema = conditionGroupSchema.shape.conditions.element;
+const { critical, warning, resolved } = METRIC_MONITOR_PRIORITY;
 const thresholdCondition = metricConditionSchema.extend({
-  type: z.enum(["gt", "lt", "gte", "lte"]),
+  type: z.enum(METRIC_MONITOR_THRESHOLD_TYPES),
   comparison: z.number(),
-  conditionResult: z.union([z.literal(75), z.literal(50), z.literal(0)]),
+  conditionResult: z.literal([critical, warning, resolved]),
 });
 const anomalyCondition = metricConditionSchema.extend({
   type: z.literal("anomaly_detection"),
   comparison: z.object({
     sensitivity: z.enum(["low", "medium", "high"]),
     seasonality: z.literal("auto"),
-    thresholdType: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+    thresholdType: z.literal([0, 1, 2]),
   }),
-  conditionResult: z.union([z.literal(75), z.literal(50)]),
+  conditionResult: z.literal([critical, warning]),
 });
 
 const metricMonitorQuerySchema = metricQueryDetailsSchema.extend({
-  dataset: z.enum([
-    "events",
-    "transactions",
-    "generic_metrics",
-    "metrics",
-    "events_analytics_platform",
-  ]),
+  dataset: z.enum(METRIC_MONITOR_DATASETS),
   aggregate: z.string().min(1),
   timeWindowSeconds: z.number().int().positive(),
 });
@@ -135,7 +135,9 @@ export function toMetricMonitorUpdate(
 ): MetricMonitorUpdate {
   const { status, query, config, conditionGroup, ...metadata } = params;
   const body: MetricMonitorUpdate = Object.fromEntries(
-    Object.entries(metadata).filter(([, value]) => value !== undefined),
+    Object.entries<unknown>(metadata).filter(
+      ([, value]) => value !== undefined,
+    ),
   );
   if (status !== undefined) body.enabled = status === "active";
   if (query !== undefined) {

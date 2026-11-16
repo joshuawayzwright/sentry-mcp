@@ -6,9 +6,11 @@ Step-by-step guide for adding new tools to the Sentry MCP server.
 
 Not every tool is exposed to every consumer. We rely on several mechanisms to keep the active tool set manageable:
 
-- **Catalog by default** — Most tools are searchable/executable through `search_sentry_tools` + `execute_sentry_tool` automatically. Search uses the tool's existing name and description.
+- **Every tool is direct by default** — `EXPOSE_ALL_TOOLS` in `packages/mcp-core/src/tools/exposure.ts` is on, so every catalog tool that passes the filters below is listed in MCP `tools/list`, and `search_sentry_tools` + `execute_sentry_tool` are not registered. Tier 1 harnesses defer MCP tool schemas behind their own tool search, which indexes each tool's name and description, so write both with search in mind. The flag is a code constant, not a runtime option; turning it off restores the gateway surface described in the next bullets.
+- **Deprecated tools** — Mark an old name kept for backward compatibility with `deprecated: { replacedBy: ["new_tool"] }` on its tool config. Deprecated tools are never listed in `tools/list`, so harness search does not return them next to the tools that replaced them. With `EXPOSE_ALL_TOOLS` off they stay reachable through `execute_sentry_tool`. `toolDefinitions.json` carries the same field.
+- **Catalog gateway (flag off)** — Tools are searchable/executable through `search_sentry_tools` + `execute_sentry_tool`. Search uses the tool's existing name and description.
 - **Catalog registry** — `packages/mcp-core/src/tools/catalog/index.ts` lists ordinary Sentry operation tools. The catalog directory is intentionally flat: one tool entry per file.
-- **Central direct exposure policy** — `packages/mcp-core/src/tools/surfaces.ts` lists the catalog tools that are also exposed directly through MCP `tools/list`. The direct surface intentionally keeps long-tail tools catalog-only because `search_sentry_tools` + `execute_sentry_tool` are available as primary primitives.
+- **Central direct exposure policy (flag off)** — `packages/mcp-core/src/tools/surfaces.ts` lists the catalog tools that are also exposed directly through MCP `tools/list`. The direct surface intentionally keeps long-tail tools catalog-only because `search_sentry_tools` + `execute_sentry_tool` are available as primary primitives.
 - **`requiredCapabilities`** — Tools declare which project capabilities they need (e.g. `profiles`, `replays`, `traces`). If the upstream project doesn't have a capability enabled, the tool is automatically hidden.
 - **`experimental` / `hideInExperimentalMode`** — Feature flags for tools that are being tested or replaced.
 - **Skills & constraints** — The server filters tools based on granted skills and org/project constraints.
@@ -17,9 +19,12 @@ We also expect upstream consumers (Claude Code plugins, Cursor, etc.) to use **t
 
 ## Tool Count Limits
 
-Target ~20 publicly visible tools. Never exceed 25. AI agents have limited tool slots (Cursor caps at 45 total across all providers), so Sentry MCP cannot consume all available slots.
+With `EXPOSE_ALL_TOOLS` on, harness tool search keeps the full tool list out of the context window, so the limit below applies to the gateway surface (`TOP_LEVEL_TOOL_NAMES`) that the flag falls back to.
+
+Target ~20 tools on the gateway surface. Never exceed 25. AI agents have limited tool slots (Cursor caps at 45 total across all providers), so Sentry MCP cannot consume all available slots.
 
 Before adding a new tool, consider if it could be:
+
 1. Combined with an existing tool
 2. Implemented as a parameter variant
 3. Added to the searchable catalog instead of the top-level MCP surface
@@ -45,6 +50,7 @@ Do not add search-only summaries or catalog-only schemas. `search_sentry_tools` 
 ## Tool Structure
 
 Each tool consists of:
+
 1. **Tool Module** - Single file in `src/tools/catalog/your-tool-name.ts` with definition and handler
 2. **Tests** - Unit tests in `src/tools/catalog/your-tool-name.test.ts`, including a baseline happy-path inline snapshot
 3. **Mocks** - API responses in `mcp-server-mocks`
@@ -66,6 +72,7 @@ import type { ServerContext } from "../../types";
 
 export default defineTool({
   name: "your_tool_name",
+  title: "Your Tool Name",
   description: [
     "One-line summary.",
     "",
@@ -97,16 +104,27 @@ export default defineTool({
 });
 ```
 
+### Title
+
+**REQUIRED**: Every tool sets `title`, a short Title Case display name such as
+`"Search Issues"`. The server exports it as the MCP tool `title`, which clients
+show instead of the snake_case `name`. Titles must be unique across tools; the
+[metadata linter](tool-responses.md#metadata-linter) enforces this for listed
+tools, and `tools.test.ts` for tools that never appear in tools/list. Deprecated
+aliases add a ` (Deprecated)` suffix, for example
+`"Search AI Conversations (Deprecated)"`.
+
 ### Safety Annotations
 
 **REQUIRED**: Every tool must declare `readOnlyHint`, `destructiveHint`, and
 `openWorldHint` explicitly (each `true` or `false`, never omitted). This is
-enforced at compile time (the `annotations` type requires them) and by
-`tools.test.ts`, because filters and confirmation gates depend on these hints;
+enforced at compile time (the `annotations` type requires them) and by the
+[metadata linter](tool-responses.md#metadata-linter), because filters and confirmation gates depend on these hints;
 an absent hint is a silent gap. Read-only tools must set `destructiveHint: false`
 (not leave it undefined).
 
 **Available annotations:**
+
 - `readOnlyHint` (boolean): Tool doesn't modify data
 - `destructiveHint` (boolean): Tool may modify/delete existing data
 - `idempotentHint` (boolean, optional): Repeated calls with same arguments have no additional effect
@@ -138,9 +156,18 @@ annotations: {
 }
 ```
 
+The catalog gives every tool with `readOnlyHint: true` and
+`openWorldHint: true` a shared `fresh` input (`ParamFresh`), except the docs
+tools, which do not call the Sentry API. Do not declare `fresh` yourself. A
+call with `fresh: true` runs the handler in a request scope where the shared
+transport skips cached reads, and the handler never sees the input.
+
 ### Writing LLM-Friendly Descriptions
 
 Critical for LLM success:
+
+- Make the first line say what the tool does to which Sentry object, in the words a user would type ("List or search projects", "stack trace", "client key"). Harness tool search ranks tools by name and description (Codex uses BM25 and returns 8 matches; see docs/mcp/harnesses.md), and some harnesses cut descriptions to about 120 characters.
+- When tools have similar names, say which sibling to use instead (for example cron vs. uptime vs. metric monitors).
 - Start with "Use this tool when you need to:"
 - Include concrete examples
 - Reference related tools
@@ -164,16 +191,16 @@ async handler(params, context: ServerContext) {
     );
   }
 
-  // 3. Set organization telemetry for streamed spans and error events
-  // Import from ../../telem/organization.
-  setOrganizationContext(params.organizationSlug);
+  // 3. Set telemetry context for streamed spans and error events
+  // Import from ../../telem/scope.
+  setTargetTagsAndAttributes(params);
 
   // 4. Call API
   const data = await api.yourMethod(params);
 
   // 5. Format response
   let output = `# Results in **${params.organizationSlug}**\n\n`;
-  
+
   if (data.length === 0) {
     return output + "No results found.\n";
   }
@@ -222,9 +249,9 @@ describe("your_tool_name", () => {
         accessToken: "test-token",
         userId: "1",
         organizationSlug: null,
-      }
+      },
     );
-    
+
     expect(result).toMatchInlineSnapshot(`
       "# Results in **test-org**
       
@@ -235,6 +262,7 @@ describe("your_tool_name", () => {
 ```
 
 **Testing Requirements:**
+
 - Input validation (see [../testing/overview.md](../testing/overview.md#testing-error-cases))
 - Error handling (use patterns from [error-handling.md](error-handling.md))
 - Output formatting with snapshots
@@ -246,8 +274,9 @@ describe("your_tool_name", () => {
 - API integration with MSW mocks
 
 **After changing output, update snapshots:**
+
 ```bash
-cd packages/mcp-server
+cd packages/mcp-core
 pnpm vitest --run -u
 ```
 
@@ -264,7 +293,7 @@ In `packages/mcp-server-mocks/src/handlers/`:
     if (!params.org) {
       return HttpResponse.json("Invalid org", { status: 400 });
     }
-    
+
     // Return fixture
     return HttpResponse.json(yourDataFixture);
   }
@@ -282,7 +311,7 @@ describeEval("your-tool", {
   data: async () => [
     {
       input: `Primary use case in ${FIXTURES.organizationSlug}`,
-      expected: "Expected response"
+      expected: "Expected response",
     },
     // Maximum 2-3 scenarios!
   ],
@@ -314,11 +343,12 @@ pnpm eval your-tool
 - [ ] Unit tests with snapshots
 - [ ] Mock responses
 - [ ] 1-2 eval tests (if critical)
+- [ ] `outputSchema` declared, or a reasoned skip entry in the [metadata linter](tool-responses.md#metadata-linter)
 - [ ] Run quality checks
 
 ## Agent-in-Tool Pattern
 
-Some tools (`search_events`, `search_issue_events`, and `search_issues`) embed
+Some tools (the dataset search tools such as `search_errors`, plus `search_issue_events` and `search_issues`) embed
 AI agents to normalize search parameters before the handler calls Sentry. Treat
 the agent as a repair step for a structured request, not only as a natural
 language query translator. The agent may rewrite the query string, but it may
@@ -359,7 +389,7 @@ async handler(params, context) {
         sort: params.sort,
         statsPeriod: params.period,
       };
-  
+
   // Tool executes either the repaired request or the direct parameters.
   const results = await apiService.searchEvents({
     query: request.query,
@@ -368,7 +398,7 @@ async handler(params, context) {
     sort: request.sort,
     statsPeriod: request.statsPeriod,
   });
-  
+
   return formatResults(results);
 }
 ```
@@ -390,6 +420,7 @@ of hiding them behind an un-repaired direct search.
 ### Error Handling Philosophy
 
 **DO NOT retry internally**. When the embedded agent fails:
+
 1. Throw a clear `UserInputError` or `LLMProviderError` with specific guidance
 2. Let the calling agent (Claude/Cursor) see the error
 3. The calling agent can retry with corrections if needed
@@ -463,13 +494,13 @@ The `search_docs` tool demonstrates this pattern:
 // In the Worker (routes/search.ts)
 export default new Hono().post("/", async (c) => {
   const { query, maxResults } = await c.req.json();
-  
+
   // Access Worker-specific bindings
   const results = await c.env.AI.autorag("sentry-docs").aiSearch({
     query,
     max_num_results: maxResults,
   });
-  
+
   return c.json({ results });
 });
 
@@ -478,15 +509,15 @@ search_docs: async (context, params) => {
   const response = await fetch(`${context.host}/api/search`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${context.accessToken}`,
+      Authorization: `Bearer ${context.accessToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(params),
   });
-  
+
   const data = await response.json();
   // Format and return results
-}
+};
 ```
 
 This pattern works with both Cloudflare-hosted and stdio transports.

@@ -1,4 +1,4 @@
-import { describeEval } from "vitest-evals";
+import { describeEval } from "vitest-evals/legacy";
 import { FIXTURES, NoOpTaskRunner, ToolPredictionScorer } from "./utils";
 
 describeEval("get-sentry-resource", {
@@ -45,6 +45,17 @@ describeEval("get-sentry-resource", {
             name: "get_sentry_resource",
             arguments: {
               url: FIXTURES.traceUrl,
+            },
+          },
+        ],
+      },
+      {
+        input: `What widgets are on this dashboard? ${FIXTURES.dashboardUrl}`,
+        expectedTools: [
+          {
+            name: "get_sentry_resource",
+            arguments: {
+              url: FIXTURES.dashboardUrl,
             },
           },
         ],

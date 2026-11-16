@@ -1,0 +1,312 @@
+/**
+ * Tests for help-as-positional-arg error recovery in buildCommand.
+ *
+ * When a command throws a CliError and a positional arg was `"help"`,
+ * the buildCommand wrapper recovers by showing the command's help
+ * instead of the confusing error.
+ *
+ * This only fires as error recovery — if a command successfully resolves
+ * a legitimate value like a project named "help", the recovery never runs.
+ *
+ * Tests run commands through Stricli's `run()` with `help` as a positional
+ * and verify help output is shown when resolution fails.
+ */
+
+import { generateHelpTextForAllCommands, run } from "@stricli/core";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { app } from "../../src/app.js";
+import type { SentryContext } from "../../src/context.js";
+import { mockFetch, useTestConfigDir } from "../helpers.js";
+
+useTestConfigDir("help-positional-");
+
+// Silence unmocked fetch calls from the resolution cascade.
+// Commands run through run(app, args) with "help" as a positional arg
+// trigger real resolution (e.g., findProjectsBySlug("help") → listOrganizations)
+// before the help-recovery error handler fires. A silent 404 prevents
+// preload warnings while preserving the error → recovery behavior.
+let originalFetch: typeof globalThis.fetch;
+
+beforeEach(() => {
+  originalFetch = globalThis.fetch;
+  globalThis.fetch = mockFetch(
+    async () =>
+      new Response(JSON.stringify({ detail: "Not found" }), { status: 404 }),
+  );
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
+
+/** Captured output from a command run */
+type CapturedOutput = {
+  stdout: string;
+  stderr: string;
+};
+
+/**
+ * Build a mock context with forCommand support.
+ *
+ * Stricli calls `forCommand({ prefix })` before running the command.
+ * We must provide it so `commandPrefix` is set on the context, enabling
+ * the help recovery logic in `buildCommand`.
+ */
+function buildMockContext(
+  captured: {
+    stdout: string;
+    stderr: string;
+  },
+  extra: Partial<SentryContext> = {},
+): SentryContext & {
+  forCommand: (opts: { prefix: readonly string[] }) => SentryContext;
+} {
+  const stdoutWriter = {
+    write(data: string | Uint8Array) {
+      captured.stdout +=
+        typeof data === "string" ? data : new TextDecoder().decode(data);
+      return true;
+    },
+  };
+  const stderrWriter = {
+    write(data: string | Uint8Array) {
+      captured.stderr +=
+        typeof data === "string" ? data : new TextDecoder().decode(data);
+      return true;
+    },
+  };
+
+  const baseContext: SentryContext = {
+    process,
+    env: process.env,
+    cwd: process.cwd(),
+    homeDir: "/tmp",
+    configDir: "/tmp",
+    stdout: stdoutWriter,
+    stderr: stderrWriter,
+    stdin: process.stdin,
+  };
+
+  return {
+    ...baseContext,
+    forCommand: ({ prefix }: { prefix: readonly string[] }): SentryContext => ({
+      ...baseContext,
+      commandPrefix: prefix,
+      ...extra,
+    }),
+  };
+}
+
+/**
+ * Run a command through Stricli and capture stdout/stderr.
+ *
+ * Commands that hit resolution errors with "help" as a positional arg
+ * will be recovered by the buildCommand wrapper, which shows help output
+ * instead of the error.
+ */
+async function runCommand(
+  args: string[],
+  extra?: Partial<SentryContext>,
+): Promise<CapturedOutput> {
+  const captured = { stdout: "", stderr: "" };
+  const mockContext = buildMockContext(captured, extra);
+
+  try {
+    await run(app, args, mockContext);
+  } catch {
+    // Some commands may still throw (e.g., uncaught errors)
+  }
+
+  return captured;
+}
+
+describe("help recovery on ResolutionError", () => {
+  test("is off for direct (typed SDK) invocations", async () => {
+    // The typed SDK sets directInvoke; its callers get the error, not help
+    const args = ["issue", "list", "help"];
+    const recovered = await runCommand(args);
+    const direct = await runCommand(args, { directInvoke: true });
+
+    expect(recovered.stdout).toContain("sentry issue list");
+    expect(direct.stdout).not.toContain("sentry issue list");
+    expect(direct.stderr).not.toContain("Tip");
+  });
+
+  test("sentry issue list help → shows help for issue list", async () => {
+    // "help" is treated as a project slug, fails resolution → recovery shows help
+    const { stdout, stderr } = await runCommand(["issue", "list", "help"]);
+
+    expect(stdout).toContain("sentry issue list");
+    expect(stderr).toContain("--help");
+    expect(stderr).toContain("Tip");
+  });
+
+  test("sentry project list help → shows help for project list", async () => {
+    const { stdout, stderr } = await runCommand(["project", "list", "help"]);
+
+    expect(stdout).toContain("sentry project list");
+    expect(stderr).toContain("--help");
+  });
+
+  test("sentry span list help → shows help for span list", async () => {
+    const { stdout, stderr } = await runCommand(["span", "list", "help"]);
+
+    expect(stdout).toContain("sentry span list");
+    expect(stderr).toContain("--help");
+  });
+
+  test("stderr hint includes the correct command path", async () => {
+    const { stderr } = await runCommand(["issue", "list", "help"]);
+
+    expect(stderr).toContain("sentry issue list --help");
+  });
+
+  test("sentry project view help → recovers through a parsed target positional", async () => {
+    // project view's positional reaches func parsed, not as a string
+    const { stdout, stderr } = await runCommand(["project", "view", "help"]);
+
+    expect(stdout).toContain("sentry project view");
+    expect(stderr).toContain("sentry project view --help");
+  });
+});
+
+describe("help recovery on ValidationError", () => {
+  test("sentry trace view help → shows help for trace view", async () => {
+    // "help" fails hex ID validation → ValidationError → recovery shows help
+    const { stdout, stderr } = await runCommand(["trace", "view", "help"]);
+
+    expect(stdout).toContain("sentry trace view");
+    expect(stderr).toContain("--help");
+  });
+
+  test("sentry log view help → shows help for log view", async () => {
+    const { stdout, stderr } = await runCommand(["log", "view", "help"]);
+
+    expect(stdout).toContain("sentry log view");
+    expect(stderr).toContain("--help");
+  });
+});
+
+describe("help recovery on argument parse errors", () => {
+  test("sentry replay view help → shows help instead of the parse error", async () => {
+    // `replay view`'s arguments parse together in the command wrapper; "help"
+    // fails as a replay ID there, where recovery can still catch it
+    const { stdout, stderr } = await runCommand(["replay", "view", "help"]);
+
+    expect(stdout).toContain("sentry replay view");
+    expect(stderr).toContain("sentry replay view --help");
+    expect(stderr).not.toContain("Failed to parse");
+  });
+
+  test("sentry trace logs help → shows help instead of the parse error", async () => {
+    const { stdout, stderr } = await runCommand(["trace", "logs", "help"]);
+
+    expect(stdout).toContain("sentry trace logs");
+    expect(stderr).toContain("sentry trace logs --help");
+    expect(stderr).not.toContain("Failed to parse");
+  });
+
+  test("sentry replay view not-hex → argument parse error", async () => {
+    // Stricli writes argument errors to the real process's stderr
+    const stderrWrite = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      const { stdout } = await runCommand(["replay", "view", "not-hex"]);
+      expect(stdout).not.toContain("sentry replay view");
+      expect(stderrWrite.mock.calls.map(([s]) => String(s)).join("")).toContain(
+        'Failed to parse "not-hex" for replay-id-or-url',
+      );
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  test("argument parse errors don't echo pasted auth tokens", async () => {
+    const stderrWrite = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      await runCommand([
+        "token",
+        "delete",
+        "my-org/sntrys_eyJpYXQiOjE3MDB9_abc",
+      ]);
+      const stderr = stderrWrite.mock.calls.map(([s]) => String(s)).join("");
+      expect(stderr).toContain("looks like a token value, not a token ID");
+      expect(stderr).not.toContain("sntrys_");
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+});
+
+describe("help command unchanged", () => {
+  test("sentry help still shows branded help", async () => {
+    const { stdout, stderr } = await runCommand(["help"]);
+
+    // Custom help command shows branded output — no recovery needed
+    expect(stdout).toContain("sentry");
+    // Should NOT have the recovery tip
+    expect(stderr).not.toContain("Tip");
+  });
+
+  test("sentry help issue list still shows introspected help", async () => {
+    const { stdout, stderr } = await runCommand(["help", "issue", "list"]);
+
+    expect(stdout).toContain("sentry issue list");
+    // Should NOT have the recovery tip — this is the normal help path
+    expect(stderr).not.toContain("Tip");
+  });
+
+  test("sentry help project create shows the public positional syntax", async () => {
+    const { stdout, stderr } = await runCommand(["help", "project", "create"]);
+
+    expect(stdout).toContain(
+      "sentry project create [<org>/]<name>:<platform>...",
+    );
+    expect(stderr).not.toContain("Tip");
+  });
+
+  test("project create --help shows the required paired syntax", () => {
+    const help = generateHelpTextForAllCommands(app).find(
+      ([route]) => route === "sentry project create",
+    )?.[1];
+
+    expect(help).toContain(
+      "sentry project create [<org>/]<name>:<platform>...",
+    );
+    expect(help).not.toContain("--platform");
+    expect(help).not.toContain("<name-or-platform>");
+    expect(help).toContain("cannot contain whitespace");
+  });
+});
+
+describe("project create parser contract", () => {
+  test.each(["--platform", "-p"])(
+    "rejects the removed %s flag",
+    async (flag) => {
+      const captured = { stdout: "", stderr: "" };
+      const mockContext = buildMockContext(captured);
+      const stderrWrite = vi
+        .spyOn(process.stderr, "write")
+        .mockImplementation(() => true);
+
+      try {
+        await run(
+          app,
+          ["project", "create", "my-app:node", flag, "javascript"],
+          mockContext,
+        );
+
+        const errorOutput = stderrWrite.mock.calls
+          .map(([data]) => String(data))
+          .join("");
+        expect(errorOutput).toContain(flag);
+        expect(errorOutput).toMatch(/No (flag|alias) registered/);
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    },
+  );
+});

@@ -1,0 +1,823 @@
+/**
+ * Issue API functions
+ *
+ * Functions for listing, retrieving, and updating Sentry issues.
+ */
+
+import type {
+  GetOrganizationIssueData,
+  ListOrganizationIssuesData,
+  UpdateOrganizationIssueData,
+} from "@sentry/api";
+import {
+  getOrganizationIssue,
+  getOrganizationSharedIssue,
+  listOrganizationIssues,
+  resolveOrganizationShortId,
+  updateOrganizationIssue,
+  updateOrganizationIssues,
+} from "@sentry/api";
+import { API_BASE_PATH } from "@sentry/api/client";
+import pLimit from "p-limit";
+
+import type { SentryIssue } from "../../types/index.js";
+import type { IssueSubstatus } from "../../types/sentry.js";
+import { sentry } from "../app-identity.js";
+import {
+  buildTlsErrorDetail,
+  customFetch,
+  isTlsCertError,
+  warnIfSaasWithEnvCa,
+} from "../custom-ca.js";
+import { applyCustomHeaders } from "../custom-headers.js";
+import { ApiError, ValidationError } from "../errors.js";
+
+import {
+  getOrgSdkConfig,
+  ORG_FANOUT_CONCURRENCY,
+  type PaginatedResponse,
+  paginate,
+  unwrapPaginatedResult,
+  unwrapResult,
+} from "./infrastructure.js";
+
+const TRAILING_SLASH_RE = /\/$/;
+
+/**
+ * Sort options for issue listing, derived from the @sentry/api SDK types.
+ * Uses the SDK type directly for compile-time safety against parameter drift.
+ */
+export type IssueSort = NonNullable<
+  NonNullable<ListOrganizationIssuesData["query"]>["sort"]
+>;
+
+/**
+ * Collapse options for issue listing, derived from the @sentry/api SDK types.
+ * Each value tells the server to skip computing that data field, avoiding
+ * expensive Snuba/ClickHouse queries on the backend.
+ *
+ * - `'stats'` — time-series event counts (sparkline data)
+ * - `'lifetime'` — lifetime aggregate sub-object AND top-level count/userCount/firstSeen/lastSeen on list endpoints
+ * - `'filtered'` — filtered aggregate counts
+ * - `'unhandled'` — unhandled event flag computation
+ * - `'base'` — base group fields (rarely useful to collapse)
+ */
+export type IssueCollapseField = NonNullable<
+  NonNullable<ListOrganizationIssuesData["query"]>["collapse"]
+>[number];
+
+/**
+ * Build the `collapse` parameter for issue list API calls.
+ *
+ * Always collapses `unhandled` — the CLI never consumes it in issue list
+ * views. Collapses `filtered` unless the caller needs query-scoped counts.
+ * Conditionally collapses `stats` when the caller confirms seen-stats fields
+ * aren't needed, and `lifetime` when the caller confirms lifetime-dependent
+ * fields aren't needed.
+ *
+ * **Important:** `collapse=stats` skips Snuba seen-stats queries entirely,
+ * stripping top-level `count`, `userCount`, `firstSeen`, `lastSeen` and the
+ * sparkline `stats` object — not just the time-series. See #1219.
+ *
+ * **Important:** Despite being documented as removing only the `lifetime`
+ * sub-object, `collapse=lifetime` also strips the top-level `count`,
+ * `userCount`, `firstSeen`, and `lastSeen` fields from list responses.
+ * Only collapse it when those fields are confirmed unnecessary. See #969.
+ *
+ * @param options - Context for determining what to collapse
+ * @param options.shouldCollapseStats - Whether stats data can be skipped
+ *   (true only when `--json --fields` omits all seen-stats-dependent fields)
+ * @param options.shouldCollapseLifetime - Whether lifetime data can be skipped.
+ *   Defaults to `false` because most output paths need `count`/`userCount`/
+ *   `firstSeen`/`lastSeen`. Only set to `true` when `--json --fields` omits
+ *   all lifetime-dependent fields.
+ * @param options.shouldCollapseFiltered - Whether the `filtered` block can be
+ *   skipped. Defaults to `true`. Set to `false` to receive counts scoped to
+ *   the query's event-level filters (e.g. `release:`), which the top-level
+ *   `count`/`userCount` ignore. The server only returns `filtered` when
+ *   `stats` is not collapsed.
+ * @returns Array of fields to collapse
+ */
+export function buildIssueListCollapse(options: {
+  shouldCollapseStats: boolean;
+  shouldCollapseLifetime?: boolean;
+  shouldCollapseFiltered?: boolean;
+}): IssueCollapseField[] {
+  const collapse: IssueCollapseField[] =
+    (options.shouldCollapseFiltered ?? true)
+      ? ["filtered", "unhandled"]
+      : ["unhandled"];
+  if (options.shouldCollapseLifetime) {
+    collapse.push("lifetime");
+  }
+  if (options.shouldCollapseStats) {
+    collapse.push("stats");
+  }
+  return collapse;
+}
+
+/** Collapse values the issue details endpoint acts on. */
+type IssueDetailsCollapseField = NonNullable<
+  NonNullable<GetOrganizationIssueData["query"]>["collapse"]
+>[number];
+
+const ISSUE_DETAILS_COLLAPSE_FIELDS: ReadonlySet<string> =
+  new Set<IssueDetailsCollapseField>(["release", "stats", "tags"]);
+
+function isIssueDetailsCollapseField(
+  field: string,
+): field is IssueDetailsCollapseField {
+  return ISSUE_DETAILS_COLLAPSE_FIELDS.has(field);
+}
+
+/**
+ * Keep the collapse values the issue details endpoint reads. It ignores
+ * `lifetime`, `filtered` and `unhandled`, which only the list and short-ID
+ * endpoints act on.
+ */
+function toIssueDetailsCollapse(
+  collapse: IssueCollapseField[] | undefined,
+): IssueDetailsCollapseField[] | undefined {
+  const fields = collapse?.flatMap((field) =>
+    isIssueDetailsCollapseField(field) ? [field] : [],
+  );
+  return fields?.length ? fields : undefined;
+}
+
+/**
+ * Collapse fields for single-issue detail endpoints.
+ *
+ * The CLI never displays stats (sparkline time-series), lifetime (aggregate
+ * sub-object), filtered (filtered counts), or unhandled (unhandled sub-object)
+ * in detail views (`issue view`, `issue explain`, `issue plan`).
+ * Collapsing these skips expensive Snuba queries, saving 100-300ms per request.
+ *
+ * Note: On the **list** endpoint, `collapse=lifetime` strips top-level
+ * `count`, `userCount`, `firstSeen`, `lastSeen` (see #969). The detail
+ * endpoint preserves these fields regardless of collapse — safe to include
+ * `lifetime` here. The short-ID endpoint acts on all four values; the issue
+ * details endpoint acts only on `stats`, so {@link getIssueInOrg} drops the rest.
+ */
+export const ISSUE_DETAIL_COLLAPSE: IssueCollapseField[] = [
+  "stats",
+  "lifetime",
+  "filtered",
+  "unhandled",
+];
+
+/**
+ * List issues for an organization with optional project filtering.
+ *
+ * Uses the @sentry/api SDK's `listOrganizationIssues` for type-safe
+ * query parameters, and extracts pagination from the response Link header.
+ *
+ * @param orgSlug - Organization slug
+ * @param projectSlug - Single-slug fallback used when `options.projects` is
+ *   absent; pass an empty string for org-wide listing
+ * @param options - Query and pagination options
+ * @returns Single page of issues with cursor metadata
+ */
+export async function listIssuesPaginated(
+  orgSlug: string,
+  projectSlug: string,
+  options: {
+    query?: string;
+    cursor?: string;
+    perPage?: number;
+    sort?: IssueSort;
+    statsPeriod?: string;
+    /**
+     * Numeric project IDs sent as the repeated `project` query param. Selects
+     * projects directly, bypassing the "actively selected" requirement that
+     * `project:<slug>` search syntax is subject to. IDs only: self-hosted
+     * releases before 26.6 reject slugs in this param.
+     */
+    projects?: readonly number[];
+    /** Controls the time resolution of inline stats data. "auto" adapts to statsPeriod. */
+    groupStatsPeriod?: "" | "14d" | "24h" | "auto";
+    /** Fields to collapse (omit) from the response for performance.
+     *  @see {@link buildIssueListCollapse} */
+    collapse?: IssueCollapseField[];
+    /** Absolute start datetime (ISO-8601). Mutually exclusive with statsPeriod. */
+    start?: string;
+    /** Absolute end datetime (ISO-8601). Mutually exclusive with statsPeriod. */
+    end?: string;
+  } = {},
+): Promise<PaginatedResponse<SentryIssue[]>> {
+  // Prefer the API's repeated `project` parameter. A lone slug retains the
+  // search-query fallback for callers that have not resolved project identity.
+  const projects = options.projects?.length ? [...options.projects] : undefined;
+  const projectFilter =
+    projects === undefined && projectSlug ? `project:${projectSlug}` : "";
+  const fullQuery = [projectFilter, options.query].filter(Boolean).join(" ");
+
+  const config = getOrgSdkConfig();
+
+  const result = await listOrganizationIssues({
+    ...config,
+    path: { organization_id_or_slug: orgSlug },
+    query: {
+      project: projects,
+      // Convert empty string to undefined so the SDK omits the param entirely;
+      // sending `query=` causes the Sentry API to behave differently than
+      // omitting the parameter.
+      query: fullQuery || undefined,
+      cursor: options.cursor,
+      limit: options.perPage ?? 25,
+      sort: options.sort,
+      statsPeriod: options.statsPeriod,
+      start: options.start,
+      end: options.end,
+      groupStatsPeriod: options.groupStatsPeriod,
+      collapse: options.collapse,
+    },
+  });
+
+  return unwrapPaginatedResult<SentryIssue[]>(result, "Failed to list issues");
+}
+
+/** Result from {@link listIssuesAllPages}. */
+export type IssuesPage = {
+  issues: SentryIssue[];
+  /**
+   * Cursor for the next page of results, if more exist beyond the returned
+   * issues. `undefined` when exhausted or a safe page boundary is unavailable.
+   */
+  nextCursor?: string;
+};
+
+/**
+ * Auto-paginate through issues up to the requested limit.
+ *
+ * The Sentry API caps `per_page` at {@link API_MAX_PER_PAGE} server-side. When the caller
+ * requests more than that, {@link paginate} transparently fetches multiple
+ * pages and returns the combined result.
+ *
+ * @param orgSlug - Organization slug
+ * @param projectSlug - Single-slug fallback used when `options.projects` is
+ *   absent; pass an empty string for org-wide listing
+ * @param options - Query, sort, and limit options
+ * @returns Issues (up to `limit` items) and a cursor for the next page if available
+ */
+export async function listIssuesAllPages(
+  orgSlug: string,
+  projectSlug: string,
+  options: {
+    query?: string;
+    limit: number;
+    sort?: IssueSort;
+    statsPeriod?: string;
+    /** Numeric project IDs to select in one organization-scoped request. */
+    projects?: readonly number[];
+    /** Controls the time resolution of inline stats data. "auto" adapts to statsPeriod. */
+    groupStatsPeriod?: "" | "14d" | "24h" | "auto";
+    /** Resume pagination from this cursor instead of starting from the beginning. */
+    startCursor?: string;
+    /** Called after each page is fetched. Useful for progress indicators. */
+    onPage?: (fetched: number, limit: number) => void;
+    /** Fields to collapse (omit) from the response for performance.
+     *  @see {@link buildIssueListCollapse} */
+    collapse?: IssueCollapseField[];
+    /** Absolute start datetime (ISO-8601). Mutually exclusive with statsPeriod. */
+    start?: string;
+    /** Absolute end datetime (ISO-8601). Mutually exclusive with statsPeriod. */
+    end?: string;
+  },
+): Promise<IssuesPage> {
+  if (options.limit < 1) {
+    throw new Error(
+      `listIssuesAllPages: limit must be at least 1, got ${options.limit}`,
+    );
+  }
+
+  let fetched = 0;
+  const { data: issues, nextCursor } = await paginate(
+    { limit: options.limit, cursor: options.startCursor },
+    async (perPage, cursor) => {
+      const response = await listIssuesPaginated(orgSlug, projectSlug, {
+        query: options.query,
+        cursor,
+        perPage,
+        sort: options.sort,
+        statsPeriod: options.statsPeriod,
+        start: options.start,
+        end: options.end,
+        projects: options.projects,
+        groupStatsPeriod: options.groupStatsPeriod,
+        collapse: options.collapse,
+      });
+      fetched += response.data.length;
+      options.onPage?.(Math.min(fetched, options.limit), options.limit);
+      return response;
+    },
+  );
+  return { issues, nextCursor };
+}
+
+/**
+ * Get a specific issue by numeric ID, scoped to an organization.
+ *
+ * Uses the org-scoped endpoint with region-aware routing. Without a known
+ * org, use {@link findIssueInOrgs}.
+ *
+ * @param orgSlug - Organization slug (used for region routing)
+ * @param issueId - Numeric issue ID
+ * @param options - Optional collapse fields to skip expensive backend queries
+ */
+export async function getIssueInOrg(
+  orgSlug: string,
+  issueId: string,
+  options?: { collapse?: IssueCollapseField[] },
+): Promise<SentryIssue> {
+  const collapse = toIssueDetailsCollapse(options?.collapse);
+  const result = await getOrganizationIssue({
+    ...getOrgSdkConfig(),
+    path: { organization_id_or_slug: orgSlug, issue_id: issueId },
+    query: collapse ? { collapse } : undefined,
+  });
+  return unwrapResult<SentryIssue>(result, "Failed to get issue");
+}
+
+/**
+ * Find a numeric issue in whichever of the given organizations owns it.
+ *
+ * Asks each org's region rather than the unscoped `GET /issues/{id}/`,
+ * which Sentry deprecated for cell routing and browns out with 410s.
+ * Org-scoped issue routes exist on every Sentry since 24.1. Orgs are tried
+ * concurrently; no new request starts once one returns the issue.
+ *
+ * @param orgSlugs - Organizations to search, in preference order
+ * @param issueId - Numeric issue ID
+ * @param options - Optional collapse fields to skip expensive backend queries
+ * @returns The owning org and the issue, or null when no org returns it
+ * @throws {ApiError} When no org has it and one failed with something other
+ *   than a 404 or 403, since the issue may live in that org
+ */
+export async function findIssueInOrgs(
+  orgSlugs: readonly string[],
+  issueId: string,
+  options?: { collapse?: IssueCollapseField[] },
+): Promise<{ org: string; issue: SentryIssue } | null> {
+  const limit = pLimit(ORG_FANOUT_CONCURRENCY);
+  let found: { org: string; issue: SentryIssue } | null = null;
+  let failure: unknown;
+  await Promise.all(
+    orgSlugs.map((org) =>
+      limit(async () => {
+        if (found) {
+          return;
+        }
+        try {
+          const issue = await getIssueInOrg(org, issueId, options);
+          found ??= { org, issue };
+        } catch (error) {
+          if (
+            error instanceof ApiError &&
+            (error.status === 404 || error.status === 403)
+          ) {
+            return;
+          }
+          failure ??= error;
+        }
+      }),
+    ),
+  );
+  if (!found && failure) {
+    throw failure;
+  }
+  return found;
+}
+
+/**
+ * Get an issue by short ID (e.g., SPOTLIGHT-ELECTRON-4D).
+ * Requires organization context to resolve the short ID.
+ * Uses region-aware routing for multi-region support.
+ *
+ * @param orgSlug - Organization slug
+ * @param shortId - Short ID (e.g., "CLI-G5", "SPOTLIGHT-ELECTRON-4D")
+ * @param options - Optional collapse fields to skip expensive backend queries
+ */
+export async function getIssueByShortId(
+  orgSlug: string,
+  shortId: string,
+  options?: { collapse?: IssueCollapseField[] },
+): Promise<SentryIssue> {
+  const normalizedShortId = shortId.toUpperCase();
+  const config = getOrgSdkConfig();
+
+  let data: { group?: SentryIssue };
+  try {
+    const result = await resolveOrganizationShortId({
+      ...config,
+      path: { organization_id_or_slug: orgSlug, issue_id: normalizedShortId },
+      query: options?.collapse ? { collapse: options.collapse } : undefined,
+    });
+    data = unwrapResult<{ group?: SentryIssue }>(
+      result,
+      "Failed to resolve short ID",
+    );
+  } catch (error) {
+    // Enrich 404 errors with actionable context. The generic
+    // "Failed to resolve short ID: 404 Not Found" is the most common
+    // issue view error (CLI-A1, 27 users). Callers like
+    // tryGetIssueByShortId still catch ApiError by status code.
+    if (error instanceof ApiError && error.status === 404) {
+      throw new ApiError(
+        `Short ID '${normalizedShortId}' not found in organization '${orgSlug}'`,
+        404,
+        [
+          "The issue may have been deleted or merged",
+          `Verify the short ID and org: ${sentry`issue view ${orgSlug}/${normalizedShortId}`}`,
+          `List issues in this org: ${sentry`issue list ${orgSlug}/`}`,
+        ].join("\n  "),
+      );
+    }
+    throw error;
+  }
+
+  if (!data.group) {
+    throw new ApiError(
+      `Short ID ${normalizedShortId} resolved but no issue group returned`,
+      404,
+      "Issue not found",
+    );
+  }
+  return data.group;
+}
+
+/**
+ * Try to get an issue by short ID, returning null on 404.
+ *
+ * Same as {@link getIssueByShortId} but returns null instead of throwing
+ * when the short ID is not found. Useful for parallel fan-out across orgs
+ * where most will 404.
+ *
+ * @param orgSlug - Organization slug
+ * @param shortId - Full short ID (e.g., "CONSUMER-MOBILE-1QNEK")
+ * @returns The resolved issue, or null if not found in this org
+ */
+export async function tryGetIssueByShortId(
+  orgSlug: string,
+  shortId: string,
+  options?: { collapse?: IssueCollapseField[] },
+): Promise<SentryIssue | null> {
+  try {
+    return await getIssueByShortId(orgSlug, shortId, options);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+type IssueUpdateStatusDetails = NonNullable<
+  NonNullable<UpdateOrganizationIssueData["body"]>["statusDetails"]
+>;
+
+/**
+ * Resolution-release tracking for {@link updateIssueStatus}. Maps to the
+ * `statusDetails` shape expected by Sentry's bulk mutate endpoint:
+ *
+ * - `inRelease` — resolve in a specific named release (e.g. `"0.26.1"`).
+ *   Future events seen on releases **after** this one will regression-flag.
+ * - `inNextRelease: true` — resolve in the next release after the current
+ *   commit. Commonly used when the fix is merged but not yet tagged.
+ * - `inCommit` — resolve tied to a commit in a Sentry-registered repo.
+ *   Sentry resolves when a release containing the commit is created. Both
+ *   `commit` (SHA) and `repository` (Sentry-registered repo name) are
+ *   required by the API's InCommitValidator.
+ *
+ * Narrowed from the `@sentry/api` issue update body so each variant is
+ * exclusive.
+ */
+export type ResolveStatusDetails =
+  | Required<Pick<IssueUpdateStatusDetails, "inRelease">>
+  | { inNextRelease: true }
+  | Required<Pick<IssueUpdateStatusDetails, "inCommit">>;
+
+/**
+ * Sentinel string meaning "resolve in the next release (tied to HEAD)".
+ * Chosen to never clash with a real version string — `@` is not a valid
+ * character in semver or Sentry release slugs.
+ */
+export const RESOLVE_NEXT_RELEASE_SENTINEL = "@next";
+
+/**
+ * Bare sentinel meaning "resolve at the current git HEAD, auto-detecting
+ * the Sentry-registered repo from the git origin URL". The command layer
+ * resolves this into a concrete `{inCommit: {...}}` before calling the API.
+ */
+export const RESOLVE_COMMIT_SENTINEL = "@commit";
+
+/**
+ * Prefix for the explicit commit form: `@commit:<repo>@<sha>`.
+ * Kept unambiguous against monorepo release strings like `pkg@1.2.3` by
+ * requiring the full `@commit:` anchor at the start.
+ */
+export const RESOLVE_COMMIT_EXPLICIT_PREFIX = "@commit:";
+
+/**
+ * Parsed representation of the `@commit` spec family — either an
+ * "auto-detect from HEAD" request or an explicit repo + SHA pair.
+ *
+ * Auto-detection needs git + an API call, so the CLI layer converts this
+ * into `ResolveStatusDetails` asynchronously via a separate resolver.
+ */
+export type ResolveCommitSpec =
+  | { kind: "auto" }
+  | { kind: "explicit"; repository: string; commit: string };
+
+/**
+ * Parsed representation of the fully-static portion of the `--in` grammar.
+ * Static specs ({@link ResolveStatusDetails}) are ready to ship to the API;
+ * commit specs ({@link ResolveCommitSpec}) need further resolution through
+ * git and the Sentry repo list before they become `{inCommit: ...}`.
+ */
+export type ParsedResolveSpec =
+  | { kind: "static"; details: ResolveStatusDetails }
+  | { kind: "commit"; spec: ResolveCommitSpec };
+
+/**
+ * Parse an `--in` resolution-spec string into its structured form.
+ *
+ * Grammar (see command docs):
+ *
+ * - `@next`                    → `{kind: "static", details: {inNextRelease: true}}`
+ * - `@commit`                  → `{kind: "commit", spec: {kind: "auto"}}`
+ * - `@commit:<repo>@<sha>`     → `{kind: "commit", spec: {kind: "explicit", ...}}`
+ * - anything else              → `{kind: "static", details: {inRelease: <value>}}`
+ *
+ * The explicit commit form requires a `<repo>@<sha>` payload after the
+ * `@commit:` anchor. Monorepo release strings like `pkg@1.2.3` are
+ * unambiguously treated as releases because they lack the `@commit:` prefix.
+ *
+ * Empty/whitespace-only input returns `null` (treated as "no spec" by the
+ * caller, which resolves immediately without release tracking).
+ *
+ * @throws {ValidationError} When `@commit:` prefix is given without a
+ *   well-formed `<repo>@<sha>` payload.
+ */
+export function parseResolveSpec(
+  spec: string | undefined,
+): ParsedResolveSpec | null {
+  if (!spec) {
+    return null;
+  }
+  const trimmed = spec.trim();
+  if (!trimmed) {
+    return null;
+  }
+  // Sentinel matches are case-insensitive (`@NEXT`, `@Commit`, etc.) so
+  // typos and mixed-case variants don't silently fall through to
+  // inRelease. But the payload after `@commit:` keeps its original case,
+  // since repository names and SHAs are case-sensitive.
+  const lower = trimmed.toLowerCase();
+  if (lower === RESOLVE_NEXT_RELEASE_SENTINEL) {
+    return { kind: "static", details: { inNextRelease: true } };
+  }
+  if (lower === RESOLVE_COMMIT_SENTINEL) {
+    return { kind: "commit", spec: { kind: "auto" } };
+  }
+  if (lower.startsWith(RESOLVE_COMMIT_EXPLICIT_PREFIX)) {
+    const payload = trimmed.slice(RESOLVE_COMMIT_EXPLICIT_PREFIX.length);
+    // Split on the LAST `@` so repo names containing `@` (rare but legal
+    // for scoped npm-style names like `@acme/web`) resolve correctly.
+    const splitIdx = payload.lastIndexOf("@");
+    if (splitIdx <= 0 || splitIdx === payload.length - 1) {
+      throw new ValidationError(
+        `Invalid --in spec: '${spec}' — expected '${RESOLVE_COMMIT_EXPLICIT_PREFIX}<repo>@<sha>'.`,
+        "in",
+      );
+    }
+    const repository = payload.slice(0, splitIdx).trim();
+    const commit = payload.slice(splitIdx + 1).trim();
+    if (!(repository && commit)) {
+      throw new ValidationError(
+        `Invalid --in spec: '${spec}' — repo and SHA must both be non-empty.`,
+        "in",
+      );
+    }
+    return { kind: "commit", spec: { kind: "explicit", repository, commit } };
+  }
+  // Anything else starting with `@` is almost certainly a mistyped
+  // sentinel — reject with a clear message instead of silently creating
+  // a release named (e.g.) "@netx" that the user didn't intend.
+  if (trimmed.startsWith("@")) {
+    throw new ValidationError(
+      `Invalid --in spec: '${spec}' is not a recognized sentinel.\n\n` +
+        `Expected '${RESOLVE_NEXT_RELEASE_SENTINEL}', '${RESOLVE_COMMIT_SENTINEL}', or '${RESOLVE_COMMIT_EXPLICIT_PREFIX}<repo>@<sha>'.\n` +
+        "If you meant a literal release name, it cannot start with '@'.",
+      "in",
+    );
+  }
+  return { kind: "static", details: { inRelease: trimmed } };
+}
+
+/**
+ * Ignore/archive conditions for {@link updateIssueStatus}.
+ *
+ * - `ignoreDuration` — ignore for N minutes
+ * - `ignoreCount` / `ignoreWindow` — ignore until N events in M minutes
+ * - `ignoreUserCount` / `ignoreUserWindow` — ignore until N users in M minutes
+ */
+export type IgnoreStatusDetails = {
+  ignoreDuration?: number;
+  ignoreCount?: number;
+  ignoreWindow?: number;
+  ignoreUserCount?: number;
+  ignoreUserWindow?: number;
+};
+
+/**
+ * Update an issue's status.
+ *
+ * - `"resolved"` — optional `statusDetails` can pin the fix to a release
+ *   or commit (see {@link ResolveStatusDetails}).
+ * - `"ignored"` — optional `substatus` controls archive granularity;
+ *   optional `statusDetails` sets conditions (see {@link IgnoreStatusDetails}).
+ * - `"unresolved"` — reopens the issue; no additional options needed.
+ *
+ * The request goes to `options.orgSlug`'s region through the org-scoped
+ * endpoint.
+ */
+export async function updateIssueStatus(
+  issueId: string,
+  status: "resolved" | "unresolved" | "ignored",
+  options: {
+    statusDetails?: ResolveStatusDetails | IgnoreStatusDetails;
+    /** Substatus for archive granularity. */
+    substatus?: IssueSubstatus;
+    orgSlug: string;
+  },
+): Promise<SentryIssue> {
+  const body = {
+    status,
+    ...(options.statusDetails && { statusDetails: options.statusDetails }),
+    ...(options.substatus && { substatus: options.substatus }),
+  };
+  const result = await updateOrganizationIssue({
+    ...getOrgSdkConfig(),
+    path: { organization_id_or_slug: options.orgSlug, issue_id: issueId },
+    body,
+  });
+  return unwrapResult<SentryIssue>(result, "Failed to update issue");
+}
+
+/** Result of a successful issue-merge operation. */
+export type MergeIssuesResult = {
+  /** Numeric group ID that the merged issues were consolidated into. */
+  parent: string;
+  /** Numeric group IDs that were merged into the parent (excludes parent). */
+  children: string[];
+};
+
+/**
+ * Merge multiple issues into a single canonical group.
+ *
+ * Sentry auto-picks the canonical parent (typically the largest by event
+ * count). Future events with fingerprints previously matching any of the
+ * children will flow into the parent group.
+ *
+ * @param orgSlug - Organization slug (required for the bulk mutate endpoint)
+ * @param groupIds - At least 2 numeric group IDs to merge
+ * @throws {ApiError} When fewer than 2 IDs are provided, or the API rejects
+ *   (e.g. `"Only error issues can be merged."` for non-error issue types)
+ */
+export async function mergeIssues(
+  orgSlug: string,
+  groupIds: readonly string[],
+): Promise<MergeIssuesResult> {
+  if (groupIds.length < 2) {
+    throw new ValidationError(
+      `Need at least 2 issues to merge (got ${groupIds.length}).`,
+    );
+  }
+  const result = await updateOrganizationIssues({
+    ...getOrgSdkConfig(),
+    path: { organization_id_or_slug: orgSlug },
+    query: { id: groupIds.map(Number) },
+    body: { merge: true },
+  });
+  const merge = unwrapResult<{ merge?: MergeIssuesResult } | null>(
+    result,
+    "Failed to merge issues",
+  )?.merge;
+  // The bulk-mutate endpoint returns 204 when no matching issues are
+  // found — e.g. IDs out of scope, or issues deleted between resolution
+  // and the merge call.
+  if (!merge) {
+    throw new ApiError(
+      `No matching issues found for merge in '${orgSlug}'.`,
+      204,
+      "All provided issue IDs are out of scope or no longer exist.",
+      `/organizations/${encodeURIComponent(orgSlug)}/issues/?${groupIds.map((id) => `id=${encodeURIComponent(id)}`).join("&")}`,
+    );
+  }
+  return merge;
+}
+
+/**
+ * Resolve a share ID to basic issue data via the public share endpoint.
+ *
+ * This org-scoped endpoint does not require authentication.
+ * The response includes the numeric issue `id` needed to fetch full issue
+ * details via the authenticated API.
+ *
+ * @param baseUrl - The Sentry instance base URL (from the share URL)
+ * @param orgSlug - The organization that owns the shared issue
+ * @param shareId - The share ID extracted from the share URL
+ * @returns Object containing the numeric issue ID
+ * @throws {ApiError} When the share link is expired, disabled, or invalid
+ */
+export async function getSharedIssue(
+  baseUrl: string,
+  orgSlug: string,
+  shareId: string,
+): Promise<{ id: string }> {
+  const path = `organizations/${encodeURIComponent(orgSlug)}/shared/issues/${encodeURIComponent(shareId)}/`;
+  const normalizedBase = baseUrl.replace(TRAILING_SLASH_RE, "");
+  const url = `${normalizedBase}${API_BASE_PATH}/${path}`;
+  const headers = new Headers({ "Content-Type": "application/json" });
+  // URL-scoped: headers only attach when `url`'s origin matches the trusted
+  // host, so IAP tokens etc. can't leak to an attacker-controlled share URL.
+  applyCustomHeaders(headers, url);
+  warnIfSaasWithEnvCa(url);
+
+  // The share URL's host may not be the logged-in one, so this goes out
+  // without the authenticated transport and its bearer token.
+  let response: Response | undefined;
+  const fetchUnauthenticated = async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    response = await customFetch(input, init);
+    return response;
+  };
+
+  let result: Awaited<ReturnType<typeof getOrganizationSharedIssue>>;
+  try {
+    result = await getOrganizationSharedIssue({
+      baseUrl: normalizedBase,
+      fetch: fetchUnauthenticated,
+      headers,
+      parseAs: "json",
+      path: { organization_id_or_slug: orgSlug, share_id: shareId },
+      throwOnError: false,
+    });
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
+    throw new ApiError(
+      "Share link returned invalid JSON",
+      response?.status ?? 0,
+      undefined,
+      path,
+    );
+  }
+
+  if ("error" in result) {
+    const status = result.response?.status;
+    if (status === undefined) {
+      const { error } = result;
+      if (error instanceof Error && isTlsCertError(error)) {
+        throw new ApiError(
+          "TLS certificate error",
+          0,
+          buildTlsErrorDetail(error),
+          path,
+        );
+      }
+      throw error;
+    }
+    if (status === 404) {
+      throw new ApiError(
+        "Share link not found or expired",
+        404,
+        "The share link may have been disabled by the issue owner.\n" +
+          "  Ask them to re-enable sharing, or use the issue ID directly.",
+        path,
+      );
+    }
+    throw new ApiError("Failed to resolve share link", status, undefined, path);
+  }
+
+  const data: unknown = result.data;
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    !("id" in data) ||
+    typeof data.id !== "string" ||
+    data.id.length === 0
+  ) {
+    throw new ApiError(
+      "Share link response missing a valid issue ID",
+      result.response?.status ?? 0,
+      undefined,
+      path,
+    );
+  }
+
+  return { id: data.id };
+}

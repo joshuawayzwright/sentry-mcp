@@ -1,7 +1,7 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import type { LanguageModel } from "ai";
 import { ConfigurationError } from "../../errors";
-import { USER_AGENT } from "../../version";
+import { getUserAgent } from "../../version";
 
 const DEFAULT_OPENAI_MODEL = "gpt-5";
 
@@ -79,13 +79,13 @@ function createAzureOpenAIFetch(baseUrl: string): typeof fetch {
     }
 
     if (input instanceof Request) {
-      return fetch(new Request(requestUrl.toString(), input), {
+      return await fetch(new Request(requestUrl.toString(), input), {
         ...init,
         headers,
       });
     }
 
-    return fetch(requestUrl.toString(), {
+    return await fetch(requestUrl.toString(), {
       ...init,
       headers,
     });
@@ -105,7 +105,7 @@ export function getAzureOpenAIModel(model?: string): LanguageModel {
   const factory = createOpenAI({
     baseURL: configuredBaseUrl,
     headers: {
-      "User-Agent": USER_AGENT,
+      "User-Agent": getUserAgent(),
     },
     name: "azure-openai",
     fetch: createAzureOpenAIFetch(configuredBaseUrl),

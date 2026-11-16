@@ -1,7 +1,146 @@
-changelogPolicy: none
-preReleaseCommand: bash bin/bump-version.sh
-targets:
-  - name: github
-  - name: npm
-    id: "@sentry/mcp-server"
-    includeNames: /^sentry-mcp-server-\d.*\.tgz$/
+minVersion: "3.11.0"
+workspaces:
+  packages/cli:
+    changelog:
+      policy: auto
+      # The CLI release also ships the documentation workspace and
+      # @sentry/mcp-server.
+      includePaths:
+        - apps/cli-docs
+        - packages/mcp-server
+      aiSummary:
+        llm:
+          model: gpt-5.6-luna-utility
+        levels: [release, category, scope]
+        minItems: 0
+        # Summarizing every scope and category of a month of changes takes
+        # longer than Craft's 120-second default.
+        timeout: 600
+        style: Keep it concise and friendly for developers; avoid hype.
+    versioning:
+      policy: auto
+      # The npm targets bump only packages/cli/package.json. These files ship
+      # with every CLI release and carry its version too. Craft writes them for
+      # the release and again for the next -dev version (postReleaseBump).
+      files:
+        # Published at the CLI's version; its bundle script fails on a mismatch.
+        - path: packages/mcp-server/package.json
+        # The plugin's version stays a plain release version, even on -dev builds.
+        - path: packages/cli/plugins/sentry-cli/.claude-plugin/plugin.json
+          stripPrerelease: true
+        # Skill frontmatter. The skill generator embeds the version too, but it
+        # needs a gitignored API schema that Craft's checkout doesn't have.
+        - path: packages/cli/plugins/sentry-cli/skills/sentry-cli/SKILL.md
+        - path: packages/cli/plugins/sentry-cli/skills/sentry-cli/references/*.md
+    postReleaseBump: true
+    releaseBranchPrefix: release/cli
+    artifactProvider:
+      name: github
+      config:
+        artifacts:
+          Build:
+            - "/^sentry-.*$/"
+            - "npm-package"
+            - "mcp-server-npm-package"
+            - "vercel"
+            - "install-scripts"
+    targets:
+      - name: npm
+        includeNames: '/^sentry-\d.*\.tgz$/'
+      # The standalone MCP server, published at the CLI's version.
+      - name: npm
+        id: "@sentry/mcp-server"
+        includeNames: '/^sentry-mcp-server-\d.*\.tgz$/'
+      # Lists that npm package in the MCP Registry. After the npm targets: the
+      # registry checks that npm serves the version.
+      - name: mcp-registry
+        manifest: server.json
+      - name: github
+        tagPrefix: "cli@"
+      - name: vercel
+        projectId: prj_wVkOnIwI3eIQbGD1Gw7qS1MqFFIK
+      - name: registry
+        apps:
+          "app:sentry":
+            name: "Sentry CLI"
+            packageUrl: "https://www.npmjs.com/package/sentry"
+            mainDocsUrl: "https://cli.sentry.dev"
+            urlTemplate: "https://github.com/getsentry/toolkit/releases/download/cli@{{version}}/{{file}}"
+            includeNames: '/^sentry-.*\.gz$/'
+            checksums:
+              - algorithm: sha256
+                format: hex
+      - name: brew
+        tap: getsentry/tools
+        formula: sentry
+        path: Formula
+        includeNames: '/^sentry-(darwin|linux)-(arm64|x64)\.gz$/'
+        template: |
+          class Sentry < Formula
+            desc "Sentry command-line tool for error monitoring and debugging"
+            homepage "https://cli.sentry.dev"
+            version "{{version}}"
+            license "FSL-1.1-Apache-2.0"
+
+            if OS.mac?
+              if Hardware::CPU.arm?
+                url "https://github.com/getsentry/toolkit/releases/download/cli@{{version}}/sentry-darwin-arm64.gz"
+                sha256 "{{checksums.sentry-darwin-arm64__gz}}"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/getsentry/toolkit/releases/download/cli@{{version}}/sentry-darwin-x64.gz"
+                sha256 "{{checksums.sentry-darwin-x64__gz}}"
+              else
+                raise "Unsupported macOS CPU architecture: #{Hardware::CPU.type}"
+              end
+            elsif OS.linux?
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/getsentry/toolkit/releases/download/cli@{{version}}/sentry-linux-arm64.gz"
+                sha256 "{{checksums.sentry-linux-arm64__gz}}"
+              elsif Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "https://github.com/getsentry/toolkit/releases/download/cli@{{version}}/sentry-linux-x64.gz"
+                sha256 "{{checksums.sentry-linux-x64__gz}}"
+              else
+                raise "Unsupported Linux CPU architecture: #{Hardware::CPU.type} (only 64-bit arm and x86_64 are supported)"
+              end
+            else
+              raise "Unsupported operating system"
+            end
+
+            def install
+              bin.install Dir["sentry-*"].first => "sentry"
+              # The release asset is a bare gzip, so the unpacked binary has no
+              # exec bit. Homebrew's cleaner only fixes that after `install`.
+              chmod 0755, bin/"sentry"
+              # Homebrew-managed completion dirs survive the build sandbox and
+              # are cleaned up by `brew uninstall`. Writing into $HOME from
+              # post_install does not work: it runs under a throwaway HOME.
+              generate_completions_from_executable(bin/"sentry", "cli", "completion")
+            end
+
+            def caveats
+              <<~EOS
+                Shell completions for bash, zsh, and fish are installed by Homebrew.
+
+                To install the Sentry CLI skill for detected AI coding agents, run:
+                  sentry cli setup --no-modify-path --no-completions
+
+                `sentry cli upgrade` refreshes the skill automatically. After a
+                `brew upgrade`, run the command above again.
+              EOS
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/sentry --version").chomp
+            end
+          end
+  # No preReleaseCommand: Craft bumps package.json through the npm target.
+  packages/logger:
+    changelog:
+      policy: auto
+    releaseBranchPrefix: "release/{{workspaceName}}"
+    targets:
+      - name: github
+        tagPrefix: "{{workspaceName}}@"
+        includeNames: '/^{{packageSimpleName}}-\d.*\.tgz$/'
+      - name: npm
+        includeNames: '/^{{packageSimpleName}}-\d.*\.tgz$/'

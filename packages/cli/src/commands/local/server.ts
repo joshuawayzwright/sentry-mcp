@@ -1,0 +1,1252 @@
+import { sentry } from "../../lib/app-identity.js";
+import {
+  choiceParser,
+  parseBindHost,
+  parseText,
+  textParser,
+} from "../../lib/completion-target.js";
+import { isHostedUiOrigin, LOCAL_SESSION_EVENT } from "./viewer-protocol.js";
+export { isHostedUiOrigin } from "./viewer-protocol.js";
+import { isLoopbackHost } from "./loopback.js";
+/**
+ * sentry local serve
+ *
+ * Start a local development server that captures Sentry SDK envelopes,
+ * or attach to one already running on the same port.
+ *
+ * On startup the command probes `http://<host>:<port>/health`. If a server
+ * is already listening, the command attaches as an SSE consumer and tails
+ * events from it. Otherwise it starts its own Hono HTTP server.
+ *
+ * The command runs until interrupted (Ctrl-C / SIGTERM).
+ */
+
+import type { Server } from "node:http";
+import { basename } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { serve } from "@hono/node-server";
+import {
+  ingestReceiverEnvelope,
+  readReceiverBody,
+  receiverEnvelopeId,
+  type ReceiverEnvelope,
+  type ReceiverBuffer,
+} from "./receiver-ingest.js";
+import { type Context, Hono } from "hono";
+import { cors } from "hono/cors";
+import { streamSSE } from "hono/streaming";
+import type { SentryContext } from "../../context.js";
+import { buildCommand, numberParser } from "../../lib/command.js";
+import { ValidationError } from "../../lib/errors.js";
+import { redactCredentialText } from "../../lib/credential-redaction.js";
+import { bold } from "../../lib/formatters/colors.js";
+import type { FilterValue, FormatValue } from "../../lib/formatters/local.js";
+import {
+  FILTER_VALUES,
+  FORMAT_VALUES,
+  printLocalViewerHint,
+  formatEnvelopeLines,
+  formatEnvelopeLinesJson,
+  formatItem,
+  formatItemJson,
+  isItemIncluded,
+  SENTRY_CONTENT_TYPE,
+} from "../../lib/formatters/local.js";
+import { logger, printJsonLine, printLine } from "../../lib/logger.js";
+import {
+  formatLocalServerUrl,
+  openLocalUiIfRequested,
+  validateOpenHost,
+} from "./ui.js";
+
+import {
+  createLocalRetentionBuffer,
+  type LocalRetentionBuffer,
+  OPTIONAL_MAX_ENVELOPES_FLAG,
+  RetentionLimitError,
+  validateMaxEnvelopes,
+} from "./retention-buffer.js";
+import { LOCAL_RETENTION_EVENT } from "./retention-limits.js";
+
+/** Default port for the local dev server. */
+export const DEFAULT_PORT = 8969;
+
+/**
+ * Value advertised in the `X-Powered-By` response header.
+ *
+ * Spotlight clients (the desktop app, the browser overlay) probe `/health` and
+ * treat a sidecar as present only when this exact header value comes back —
+ * without it they assume
+ * no sidecar is running, try to start their own on the same port, fail with
+ * EADDRINUSE, and report "not connected" even though this server is happily
+ * receiving envelopes.
+ */
+export const SERVER_IDENTIFIER = "spotlight-by-sentry";
+
+/** Trailing carriage return — stripped from SSE lines. */
+const CR_RE = /\r$/;
+
+/** Maximum ingest body size (10 MB). Rejects oversized payloads early. */
+export const MAX_BODY_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Parse and validate a `--format` value.
+ * Accepts: human, json.
+ */
+export function parseFormat(value: string): FormatValue {
+  const lower = value.toLowerCase();
+  if (!FORMAT_VALUES.includes(lower as FormatValue)) {
+    throw new ValidationError(
+      `Invalid format "${value}". Valid values: ${FORMAT_VALUES.join(", ")}`,
+      "format",
+    );
+  }
+  return lower as FormatValue;
+}
+
+/**
+ * Parse and validate a `--filter` value.
+ * Accepts the canonical names: error, transaction, logger.
+ */
+export function parseFilter(value: string): FilterValue {
+  const lower = value.toLowerCase();
+  if (!FILTER_VALUES.includes(lower as FilterValue)) {
+    throw new ValidationError(
+      `Invalid filter "${value}". Valid values: ${FILTER_VALUES.join(", ")}`,
+      "filter",
+    );
+  }
+  return lower as FilterValue;
+}
+
+type LocalFlags = {
+  readonly port: number;
+  readonly host: string;
+  readonly quiet: boolean;
+  readonly filter: FilterValue[];
+  readonly format: FormatValue;
+  readonly attributes: boolean;
+  readonly open: boolean;
+  readonly session?: string;
+  readonly "max-envelopes"?: number;
+};
+
+/**
+ * Validate a port number from `--port`.
+ *
+ * Hard-fails on out-of-range values so users get a clean error rather than
+ * a `listen EADDRNOTAVAIL` from the kernel.
+ */
+export function parsePort(value: string): number {
+  const port = numberParser(value);
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+    throw new ValidationError(
+      `Invalid port: ${value}. Must be an integer between 0 and 65535.`,
+      "port",
+    );
+  }
+  return port;
+}
+
+/** Match localhost origins on any port (http or https), including IPv6. */
+const LOCALHOST_ORIGIN_RE =
+  /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
+export { isLoopbackHost } from "./loopback.js";
+
+/**
+ * Read Spotlight's `__spotlight_envelope_id` envelope header as a string.
+ * Spotlight stores a `uuidv7` UUID object there, which renders through its
+ * own `toString()`.
+ */
+export function spotlightEnvelopeId(header: Record<string, unknown>): string {
+  const id = header.__spotlight_envelope_id as
+    | { toString(): string }
+    | null
+    | undefined;
+  return id == null ? "" : id.toString();
+}
+
+type LocalReceiverOptions = {
+  /** Enables stateful UI routes only when the receiver itself is loopback-bound. */
+  uiActions?: boolean;
+  retention?: LocalRetentionBuffer;
+};
+
+function isHostedUiStreamRequest(request: {
+  method: string;
+  path: string;
+  header: (name: string) => string | undefined;
+}): boolean {
+  if (
+    !isHostedUiOrigin(request.header("origin")) ||
+    request.path !== "/stream"
+  ) {
+    return false;
+  }
+
+  return (
+    request.method === "GET" ||
+    (request.method === "OPTIONS" &&
+      request.header("access-control-request-method") === "GET")
+  );
+}
+
+/**
+ * Build the Hono application.
+ *
+ * CORS is restricted to localhost origins and the production/current-preview
+ * Sentry Local UIs. Dev stacks send from arbitrary `localhost:*` ports (Vite,
+ * Next, Astro, etc.). Remote origins may read only the SSE envelope stream.
+ */
+
+/**
+ * Build a subscriber callback that serializes envelopes to an SSE stream.
+ *
+ * @param stream - Hono SSE stream to write to
+ * @param useBase64 - Whether the client requested the `;base64` event-type
+ *   suffix (via `?base64` on `/stream`). Spotlight UI clients use the suffix
+ *   to pick their decode path, so it must be echoed back or they drop events.
+ */
+export function buildSSEHandler(
+  stream: {
+    writeSSE: (event: {
+      id?: string;
+      event?: string;
+      data: string;
+    }) => Promise<void>;
+  },
+  useBase64 = false,
+) {
+  const base64Indicator = useBase64 ? ";base64" : "";
+  return (container: ReceiverEnvelope) => {
+    try {
+      const envelopeId = receiverEnvelopeId(container);
+      const parsed = container.getParsedEnvelope();
+      let data: string;
+      try {
+        data = parsed
+          ? JSON.stringify(parsed.envelope)
+          : container.getData().toString("utf8");
+      } catch {
+        logger.debug(
+          "Local receiver is streaming raw data because decoded JSON could not serialize.",
+        );
+        data = container.getData().toString("utf8");
+      }
+      stream
+        .writeSSE({
+          id: envelopeId || undefined,
+          event: `${container.getContentType()}${base64Indicator}`,
+          data,
+        })
+        .catch((err: unknown) => {
+          logger.debug(
+            `SSE write failed (client likely disconnected): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+    } catch (err) {
+      logger.debug(
+        `SSE serialize failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+}
+
+export function buildApp(
+  buffer: ReceiverBuffer,
+  { uiActions = false, retention }: LocalReceiverOptions = {},
+): Hono {
+  const app = new Hono();
+
+  const hostedRetentionCors = cors({
+    origin: (origin) => (isHostedUiOrigin(origin) ? origin : null),
+    allowMethods: ["POST", "OPTIONS"],
+    allowHeaders: ["Content-Type"],
+  });
+
+  app.use("*", async (c, next) => {
+    c.header("X-Powered-By", SERVER_IDENTIFIER);
+    await next();
+  });
+
+  const localhostCors = cors({
+    origin: (origin) => (LOCALHOST_ORIGIN_RE.test(origin) ? origin : null),
+    allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+    allowHeaders: [
+      "Content-Type",
+      "Content-Encoding",
+      "User-Agent",
+      "Last-Event-ID",
+    ],
+  });
+  const hostedStreamCors = cors({
+    origin: (origin) => (isHostedUiOrigin(origin) ? origin : null),
+    allowMethods: ["GET", "OPTIONS"],
+    allowHeaders: ["Last-Event-ID"],
+  });
+
+  app.use("*", async (c, next) => {
+    const requestOrigin = c.req.header("origin") ?? "";
+    const hostedUiOrigin = isHostedUiOrigin(requestOrigin);
+    const hostedStreamRequest = isHostedUiStreamRequest(c.req);
+
+    const hostedRetentionRequest =
+      hostedUiOrigin &&
+      uiActions &&
+      retention &&
+      c.req.path === "/retention" &&
+      (c.req.method === "POST" ||
+        (c.req.method === "OPTIONS" &&
+          c.req.header("access-control-request-method") === "POST"));
+    // CORS alone cannot stop simple POSTs. Hosted viewers may only read the
+    // stream or change its validated retention limit; other controls stay local.
+    if (hostedUiOrigin && !hostedStreamRequest && !hostedRetentionRequest) {
+      return c.body(null, 403);
+    }
+
+    if (!hostedStreamRequest && !hostedRetentionRequest) {
+      return await localhostCors(c, next);
+    }
+
+    if (c.req.method === "OPTIONS") {
+      const isPrivateNetworkRequest =
+        c.req.header("access-control-request-private-network") === "true";
+      c.header("Access-Control-Allow-Origin", requestOrigin);
+      c.header(
+        "Access-Control-Allow-Methods",
+        hostedRetentionRequest ? "POST, OPTIONS" : "GET, OPTIONS",
+      );
+      c.header(
+        "Access-Control-Allow-Headers",
+        hostedRetentionRequest ? "Content-Type" : "Last-Event-ID",
+      );
+      if (isPrivateNetworkRequest) {
+        c.header("Access-Control-Allow-Private-Network", "true");
+      }
+      c.header(
+        "Vary",
+        [
+          "Origin",
+          "Access-Control-Request-Headers",
+          ...(isPrivateNetworkRequest
+            ? ["Access-Control-Request-Private-Network"]
+            : []),
+        ].join(", "),
+      );
+      return c.body(null, 204);
+    }
+
+    return hostedRetentionRequest
+      ? await hostedRetentionCors(c, next)
+      : await hostedStreamCors(c, next);
+  });
+
+  app.get("/health", (c) => c.text("OK"));
+
+  // These endpoints deliberately describe and manage only the in-memory
+  // receiver session. Only validated retention updates are available to the
+  // trusted hosted viewer; other controls require a loopback-served Local UI.
+  app.get("/capabilities", (c) =>
+    uiActions
+      ? c.json({
+          actions: { clear: true, envelope: true },
+          retention: "session",
+          ...retention?.getSettings(),
+        })
+      : c.body(null, 403),
+  );
+
+  app.post("/retention", async (c) => {
+    const origin = c.req.header("origin");
+    if (
+      !uiActions ||
+      !retention ||
+      (origin && !LOCALHOST_ORIGIN_RE.test(origin) && !isHostedUiOrigin(origin))
+    )
+      return c.body(null, 403);
+    const input: unknown = await c.req.json().catch(() => undefined);
+    const value =
+      typeof input === "object" && input !== null && "maxEnvelopes" in input
+        ? input.maxEnvelopes
+        : undefined;
+    try {
+      validateMaxEnvelopes(value);
+      await retention.resize(value);
+      return c.json(retention.getSettings());
+    } catch (error) {
+      if (error instanceof RetentionLimitError)
+        return c.json({ error: error.message }, error.status);
+      throw error;
+    }
+  });
+
+  app.delete("/clear", (c) => {
+    if (!uiActions) {
+      return c.body(null, 403);
+    }
+    buffer.clear();
+    return c.body(null, 204);
+  });
+
+  app.get("/envelope/:id", (c) => {
+    if (!uiActions) {
+      return c.body(null, 403);
+    }
+    try {
+      const container = buffer.read({
+        envelopeId: c.req.param("id"),
+      })[0];
+      if (!container) {
+        return c.body(null, 404);
+      }
+      return new Response(new Uint8Array(container.getData()), {
+        headers: { "Content-Type": container.getContentType() },
+      });
+    } catch (err) {
+      logger.debug(
+        `Envelope lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return c.body(null, 404);
+    }
+  });
+
+  const ingest = async (c: Context) => {
+    const body = await readReceiverBody(c.req.raw, MAX_BODY_BYTES);
+    if (typeof body === "number") return c.body(null, body);
+    // Browser SDKs using sendBeacon() set Content-Type to text/plain to
+    // avoid CORS preflight. Detect this via the sentry_client query param
+    // and override to the canonical Sentry envelope content type.
+    let contentType = c.req.header("content-type") ?? "";
+    if (
+      c.req.query("sentry_client")?.startsWith("sentry.javascript.browser") &&
+      c.req.header("origin")
+    ) {
+      contentType = SENTRY_CONTENT_TYPE;
+    }
+    const contentEncoding = c.req.header("content-encoding");
+    const userAgent = c.req.header("user-agent");
+
+    const status = await ingestReceiverEnvelope(buffer, {
+      body,
+      encoding: contentEncoding,
+      contentType,
+      userAgent,
+    });
+
+    if (status === 503) c.header("Retry-After", "1");
+    return c.body(null, status);
+  };
+
+  app.post("/stream", ingest);
+  app.post("/api/:projectId/envelope/", ingest);
+  app.post("/api/:projectId/envelope", ingest);
+
+  /**
+   * SSE stream — overlay / UI clients connect here to receive a
+   * live feed of envelopes. The SSE event format:
+   *   - `event` is the content type (e.g., "application/x-sentry-envelope"),
+   *     suffixed with `;base64` when the client passed `?base64`
+   *   - `id` is the envelope UUID (enables reconnection)
+   *   - `data` is the parsed envelope JSON ([header, items])
+   */
+  app.get("/stream", (c) => {
+    // Presence, not value: clients connect with a bare `?base64` as often
+    // as `?base64=1`, so an empty string still means "yes".
+    const useBase64 = c.req.query("base64") !== undefined;
+    return streamSSE(c, async (stream) => {
+      const lastEventId = c.req.header("Last-Event-ID");
+      const onEnvelope = buildSSEHandler(stream, useBase64);
+      const sendSettings = (settings: {
+        maxEnvelopes: number;
+        retainedEnvelopes: number;
+      }) => {
+        void stream
+          .writeSSE({
+            event: LOCAL_RETENTION_EVENT,
+            data: JSON.stringify(settings),
+          })
+          .catch((error) =>
+            logger.debug("Local retention stream closed", error),
+          );
+      };
+      const unsubscribeSettings =
+        retention && c.req.query("retention") === "1"
+          ? retention.subscribeSettings(sendSettings)
+          : () => {};
+      if (retention && c.req.query("retention") === "1")
+        sendSettings(retention.getSettings());
+      const readerId = buffer.subscribe(onEnvelope, lastEventId);
+
+      await new Promise<void>((resolve) => {
+        stream.onAbort(() => {
+          buffer.unsubscribe(readerId);
+          unsubscribeSettings();
+          resolve();
+        });
+      });
+    });
+  });
+
+  return app;
+}
+
+/**
+ * Install signal handlers that stop the HTTP server on Ctrl-C / SIGTERM.
+ *
+ * Returns a Promise that resolves when shutdown is complete. The command
+ * awaits this so the generator stays alive until the user interrupts.
+ */
+function waitForShutdown(server: Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let shuttingDown = false;
+    const onSigint = () => shutdown("SIGINT");
+    const onSigterm = () => shutdown("SIGTERM");
+
+    function shutdown(signal: NodeJS.Signals) {
+      if (shuttingDown) {
+        // oxlint-disable-next-line sentry-cli/no-process-exit -- a second SIGINT/SIGTERM during shutdown.
+        process.exit(0);
+      }
+      shuttingDown = true;
+      logger.log(`Received ${signal}, shutting down...`);
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+      server.close(() => resolve());
+      if (typeof server.closeAllConnections === "function") {
+        server.closeAllConnections();
+      }
+    }
+
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+  });
+}
+
+/** Maximum retries on EADDRINUSE before giving up. */
+const MAX_PORT_RETRIES = 3;
+
+/** Delay between EADDRINUSE retries in milliseconds. */
+const PORT_RETRY_DELAY_MS = 5000;
+
+/** Maximum time spent waiting between listen attempts. */
+export const PORT_RETRY_TIMEOUT_MS = MAX_PORT_RETRIES * PORT_RETRY_DELAY_MS;
+
+/**
+ * Try to start the HTTP server, retrying with backoff on EADDRINUSE.
+ *
+ * Retries up to {@link MAX_PORT_RETRIES} times with a {@link PORT_RETRY_DELAY_MS}
+ * delay between attempts.
+ */
+export function tryListen(
+  app: Hono,
+  port: number,
+  hostname: string,
+): Promise<{ server: Server; port: number }> {
+  let attempts = 0;
+
+  const attempt = (): Promise<{ server: Server; port: number }> =>
+    new Promise((resolve, reject) => {
+      const server = serve({
+        fetch: app.fetch,
+        port,
+        hostname,
+      }) as unknown as Server;
+
+      server.once("listening", () => {
+        const addr = server.address();
+        const boundPort = typeof addr === "object" && addr ? addr.port : port;
+        resolve({ server, port: boundPort });
+      });
+      server.once("error", async (err: NodeJS.ErrnoException) => {
+        server.close();
+        if (err.code === "EADDRINUSE") {
+          attempts += 1;
+          if (attempts > MAX_PORT_RETRIES) {
+            reject(
+              new ValidationError(
+                `Port ${port} is in use after ${MAX_PORT_RETRIES} retries`,
+                "port",
+              ),
+            );
+            return;
+          }
+          logger.warn(
+            `Port ${port} is in use, retrying in ${PORT_RETRY_DELAY_MS / 1000}s (attempt ${attempts}/${MAX_PORT_RETRIES})...`,
+          );
+          await sleep(PORT_RETRY_DELAY_MS);
+          resolve(attempt());
+          return;
+        }
+        reject(err);
+      });
+    });
+
+  return attempt();
+}
+
+/**
+ * Check whether something is already serving on the given URL.
+ *
+ * Any HTTP reply — including an error status — means the port is taken, so
+ * this deliberately does not require a 2xx. Spotlight's own sidecar can
+ * answer `/health` with a 5xx while still holding the port and ingesting
+ * envelopes; treating that as "nothing there" made the CLI try to bind the
+ * port anyway and abort with `Port 8969 is in use after 3 retries`, killing
+ * the user's dev command instead of attaching to the sidecar.
+ *
+ * Only a transport-level failure (connection refused, timeout) counts as
+ * "no server". If the responder turns out not to speak the envelope
+ * protocol, {@link consumeSSE} reports that when the stream fails to open.
+ */
+export async function isServerRunning(url: string): Promise<boolean> {
+  let res: Response;
+  try {
+    res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(2000) });
+  } catch (err) {
+    logger.debug(
+      `No existing server at ${url}`,
+      err instanceof Error ? err.message : String(err),
+    );
+    return false;
+  }
+  if (res.headers.get("X-Sentry-Local-Mode") === "daemon") {
+    throw new ValidationError(
+      "A Sentry Local daemon is using this port. Add --session <name> or choose another --port.",
+      "session",
+    );
+  }
+  if (!res.ok) {
+    logger.debug(
+      `Server at ${url} answered /health with HTTP ${res.status}; treating the port as occupied`,
+    );
+  }
+  return true;
+}
+
+/** Apply only an explicitly requested limit when attaching to an existing receiver. */
+export async function configureExistingRetention(
+  url: string,
+  maxEnvelopes?: number,
+): Promise<void> {
+  if (maxEnvelopes === undefined) return;
+  validateMaxEnvelopes(maxEnvelopes);
+  let response: Response;
+  try {
+    response = await fetch(`${url}/retention`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ maxEnvelopes }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    throw new ValidationError(
+      "Could not configure retention on the existing receiver. Start a receiver with --max-envelopes on another port.",
+      "max-envelopes",
+    );
+  }
+  const body: unknown = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const detail =
+      typeof body === "object" &&
+      body !== null &&
+      "error" in body &&
+      typeof body.error === "string"
+        ? body.error
+        : "The existing receiver does not support retention changes; choose another port.";
+    throw new ValidationError(redactCredentialText(detail), "max-envelopes");
+  }
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("maxEnvelopes" in body) ||
+    body.maxEnvelopes !== maxEnvelopes
+  ) {
+    throw new ValidationError(
+      "The existing receiver did not confirm the requested retention limit; choose another port.",
+      "max-envelopes",
+    );
+  }
+}
+
+/** Mutable state for the SSE line parser. */
+type SSEParserState = {
+  eventType: string;
+  dataLines: string[];
+  id: string;
+};
+
+/** Process a single SSE line, dispatching complete events via callback. */
+export function feedSSELine(
+  line: string,
+  state: SSEParserState,
+  onEvent: (type: string, data: string, id: string) => void,
+): void {
+  if (line.startsWith("event:")) {
+    const value = line.slice(6);
+    state.eventType = value.startsWith(" ") ? value.slice(1) : value;
+  } else if (line.startsWith("data:")) {
+    const value = line.slice(5);
+    state.dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
+  } else if (line.startsWith("id:")) {
+    const value = line.slice(3);
+    state.id = value.startsWith(" ") ? value.slice(1) : value;
+  } else if (line === "" && state.dataLines.length > 0) {
+    onEvent(state.eventType, state.dataLines.join("\n"), state.id);
+    state.eventType = "";
+    state.dataLines = [];
+    state.id = "";
+  }
+}
+
+/** Maximum SSE reconnection attempts before giving up. */
+const SSE_MAX_RECONNECTS = 10;
+
+/** Initial delay between SSE reconnection attempts (doubles each retry). */
+const SSE_INITIAL_RETRY_MS = 1000;
+
+/** Maximum delay between SSE reconnection attempts. */
+const SSE_MAX_RETRY_MS = 30_000;
+
+/** Options for consuming an SSE stream. */
+export type ConsumeSSEOptions = {
+  url: string;
+  /** A full scoped stream URL, when consuming a daemon-owned session. */
+  streamUrl?: string;
+  activeFilters: ReadonlySet<FilterValue>;
+  signal: AbortSignal;
+  quiet?: boolean;
+  useJson?: boolean;
+  showAttributes?: boolean;
+};
+
+/** Check whether an error is an abort signal. */
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+/** Sleep with abort support, suppressing abort errors. */
+async function sleepUnlessAborted(
+  ms: number,
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    await sleep(ms, undefined, { signal });
+  } catch (err) {
+    if (!isAbortError(err)) {
+      throw err;
+    }
+  }
+}
+
+/**
+ * Consume SSE events from an upstream server and print them.
+ *
+ * Reconnects automatically on connection loss with exponential backoff,
+ * using `Last-Event-ID` to resume from where the stream left off.
+ */
+export async function consumeSSE(opts: ConsumeSSEOptions): Promise<void> {
+  const {
+    url,
+    streamUrl,
+    activeFilters,
+    signal,
+    quiet = false,
+    useJson = false,
+    showAttributes = false,
+  } = opts;
+  let lastEventId: string | undefined;
+  let retries = 0;
+  let retryDelay = SSE_INITIAL_RETRY_MS;
+  let hasConnectedBefore = false;
+
+  while (!signal.aborted) {
+    const result = await attemptSSEConnection({
+      url,
+      streamUrl,
+      activeFilters,
+      signal,
+      quiet,
+      useJson,
+      showAttributes,
+      lastEventId,
+      onId: (id) => {
+        lastEventId = id;
+      },
+    });
+
+    if (signal.aborted || result === "retained") {
+      return;
+    }
+    // On the first attempt, both "no-connection" (HTTP error/no body) and
+    // "error" (network failure) are fatal — the server doesn't exist.
+    // After a previous successful connection, retry on any failure since
+    // the server may be restarting.
+    if (!hasConnectedBefore && result !== "connected-then-lost") {
+      // `/health` answered but `/stream` never opened, so nothing will ever
+      // be printed. Say so — `local run` keeps the child process going, and
+      // without this it just looks like events stopped arriving.
+      logger.warn(
+        `Could not attach to the event stream at ${redactCredentialText(streamUrl ?? `${url}/stream`)}`,
+      );
+      return;
+    }
+    // Reset backoff after a successful connection that later dropped,
+    // so transient disconnects don't permanently exhaust the retry budget.
+    if (result === "connected-then-lost") {
+      hasConnectedBefore = true;
+      retries = 0;
+      retryDelay = SSE_INITIAL_RETRY_MS;
+    }
+    retries += 1;
+    if (retries > SSE_MAX_RECONNECTS) {
+      logger.warn(
+        `SSE connection lost after ${SSE_MAX_RECONNECTS} reconnection attempts`,
+      );
+      return;
+    }
+    logger.info(
+      `SSE connection lost, reconnecting in ${retryDelay / 1000}s...`,
+    );
+    await sleepUnlessAborted(retryDelay, signal);
+    retryDelay = Math.min(retryDelay * 2, SSE_MAX_RETRY_MS);
+  }
+}
+
+/**
+ * Attempt a single SSE connection. Returns:
+ * - `"no-connection"` if the server couldn't be reached or aborted
+ * - `"connected-then-lost"` if a connection was established (got HTTP 200)
+ *   but the stream ended or errored — eligible for reconnection
+ * - `"retained"` after a session's final lifecycle message — never reconnect
+ */
+async function attemptSSEConnection(
+  opts: ConsumeSSEOnceOptions,
+): Promise<"no-connection" | "connected-then-lost" | "retained"> {
+  let wasConnected = false;
+  const augmented = {
+    ...opts,
+    onConnected: () => {
+      wasConnected = true;
+    },
+  };
+  try {
+    const completed = await consumeSSEOnce(augmented);
+    if (completed === "retained") return "retained";
+    return completed ? "connected-then-lost" : "no-connection";
+  } catch (err: unknown) {
+    if (isAbortError(err) || opts.signal.aborted) {
+      return "no-connection";
+    }
+    logger.debug(
+      `SSE error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    // If we got a 200 response before the error, the connection existed
+    // and is worth retrying. Otherwise, the server is unreachable.
+    return wasConnected ? "connected-then-lost" : "no-connection";
+  }
+}
+
+/** Options for a single SSE connection attempt. */
+type ConsumeSSEOnceOptions = {
+  url: string;
+  streamUrl?: string;
+  activeFilters: ReadonlySet<FilterValue>;
+  signal: AbortSignal;
+  quiet: boolean;
+  useJson: boolean;
+  showAttributes: boolean;
+  lastEventId: string | undefined;
+  onId: (id: string) => void;
+  /** Called when the HTTP response is received (200 OK with body). */
+  onConnected?: () => void;
+};
+
+/**
+ * Single SSE connection attempt. Returns `true` if a connection was
+ * established (received a 200 response), `false` if it never connected, and
+ * `"retained"` when the session closes after replay. Quiet tails still parse
+ * lifecycle metadata so closing capture terminates them without reconnecting.
+ */
+async function consumeSSEOnce(
+  opts: ConsumeSSEOnceOptions,
+): Promise<boolean | "retained"> {
+  const {
+    url,
+    activeFilters,
+    signal,
+    quiet,
+    useJson,
+    showAttributes,
+    lastEventId,
+    onId,
+    onConnected,
+  } = opts;
+  const headers: Record<string, string> = { Accept: "text/event-stream" };
+  if (lastEventId) {
+    headers["Last-Event-ID"] = lastEventId;
+  }
+  const res = await fetch(opts.streamUrl ?? `${url}/stream`, {
+    headers,
+    signal,
+  });
+  if (!res.ok) {
+    logger.warn(`SSE stream returned HTTP ${res.status}`);
+    return false;
+  }
+  if (!res.body) {
+    logger.debug("SSE stream returned 200 with no body");
+    return false;
+  }
+  // Signal that we have a live connection — the caller uses this to
+  // decide whether mid-stream errors are worth retrying.
+  onConnected?.();
+
+  const decoder = new TextDecoder();
+  const state: SSEParserState = { eventType: "", dataLines: [], id: "" };
+  let retained = false;
+  const onEvent = (type: string, data: string, id: string) => {
+    if (id) {
+      onId(id);
+    }
+    if (type === LOCAL_SESSION_EVENT) {
+      try {
+        const event: unknown = JSON.parse(data);
+        if (
+          typeof event === "object" &&
+          event !== null &&
+          "state" in event &&
+          event.state === "retained" &&
+          !("action" in event && event.action === "reset")
+        )
+          retained = true;
+      } catch {
+        logger.debug("Ignoring invalid Local session lifecycle event.");
+      }
+    } else if (!quiet && type === SENTRY_CONTENT_TYPE) {
+      processSSEEvent(data, activeFilters, useJson, showAttributes);
+    }
+  };
+
+  let partial = "";
+  for await (const chunk of res.body) {
+    const text =
+      partial + decoder.decode(chunk as Uint8Array, { stream: true });
+    const lines = text.split("\n");
+    partial = lines.pop() ?? "";
+    for (const rawLine of lines) {
+      feedSSELine(rawLine.replace(CR_RE, ""), state, onEvent);
+      if (retained) return "retained";
+    }
+  }
+  if (partial) {
+    feedSSELine(partial.replace(CR_RE, ""), state, onEvent);
+  }
+  return retained ? "retained" : true;
+}
+
+/** Parse and format a single SSE data payload from upstream. */
+function processSSEEvent(
+  data: string,
+  activeFilters: ReadonlySet<FilterValue>,
+  useJson = false,
+  showAttributes = false,
+): void {
+  try {
+    const envelope = JSON.parse(data) as [
+      Record<string, unknown>,
+      [{ type?: string }, unknown][],
+    ];
+    const [header, items] = envelope;
+    for (const [itemHeader, itemPayload] of items) {
+      const payload = itemPayload as Record<string, unknown>;
+      if (!isItemIncluded(itemHeader.type, activeFilters, payload)) {
+        continue;
+      }
+      const lines = useJson
+        ? formatItemJson(itemHeader.type, payload, header, showAttributes)
+        : formatItem(
+            itemHeader.type,
+            payload,
+            header,
+            itemHeader.type ?? "envelope",
+            showAttributes,
+          );
+      for (const line of lines) {
+        printLocalEventLine(line, useJson);
+      }
+    }
+  } catch (err) {
+    logger.debug(
+      `Failed to parse SSE event: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** Route human event tails to stderr and JSON observations to stdout. */
+function printLocalEventLine(line: string, useJson: boolean): void {
+  if (useJson) {
+    printJsonLine(line);
+  } else {
+    printLine(line);
+  }
+}
+
+export const serverCommand = buildCommand({
+  docs: {
+    brief: "Start the local dev server and tail events",
+    fullDescription:
+      "Start a local development server that captures envelopes from\n" +
+      "Sentry SDKs in your dev stack and tails them to the terminal.\n\n" +
+      "If a server is already listening on the port, the command connects\n" +
+      "as an SSE consumer and tails events from it. Otherwise it starts\n" +
+      "its own server. Use --open to launch the Sentry Local UI.\n\n" +
+      "Press Ctrl-C to stop.",
+    examples: [
+      {
+        description: "Start the server and tail events",
+        run: "local",
+      },
+      { description: "Use a custom port", run: "local --port 9000" },
+      {
+        description:
+          "Receive into a daemon session that outlives this terminal",
+        run: "local serve --session worker",
+      },
+      {
+        description: "Only show errors and logs (filter out transactions)",
+        run: "local -f error -f log",
+      },
+      {
+        description: "Only show AI/agent spans",
+        run: "local -f ai",
+      },
+      {
+        description: "Suppress per-envelope tail output",
+        run: "local --quiet",
+      },
+      {
+        description: "Stream NDJSON for scripts and agents",
+        run: "local --format json",
+      },
+      {
+        description: "Start the server and open the Sentry Local UI",
+        run: "local --open",
+      },
+    ],
+  },
+  parameters: {
+    flags: {
+      port: {
+        kind: "parsed",
+        parse: textParser(parsePort),
+        brief: "Port to listen on",
+        default: String(DEFAULT_PORT),
+      },
+      host: {
+        kind: "parsed",
+        parse: parseBindHost,
+        brief: "Hostname to bind to",
+        default: "localhost",
+      },
+      quiet: {
+        kind: "boolean",
+        brief: "Suppress per-envelope tail output",
+        default: false,
+      },
+      filter: {
+        kind: "parsed",
+        parse: choiceParser(FILTER_VALUES, parseFilter),
+        brief:
+          "Only show items of this type (repeatable: error, transaction, log, ai)",
+        variadic: true,
+        optional: true,
+      },
+      format: {
+        kind: "parsed",
+        parse: choiceParser(FORMAT_VALUES, parseFormat),
+        brief: "Output format: human (default) or json (NDJSON on stdout)",
+        default: "human",
+      },
+      attributes: {
+        kind: "boolean",
+        brief:
+          "Show a grouped attribute table (user vs SDK) under each transaction",
+        default: false,
+      },
+      open: {
+        kind: "boolean",
+        brief: "Open Sentry Local UI in the browser",
+        default: false,
+      },
+      "max-envelopes": OPTIONAL_MAX_ENVELOPES_FLAG,
+      session: {
+        kind: "parsed",
+        parse: parseText,
+        brief: "Create a daemon-owned telemetry session with this label",
+        optional: true,
+      },
+    },
+    aliases: {
+      p: "port",
+      H: "host",
+      q: "quiet",
+      f: "filter",
+      F: "format",
+      a: "attributes",
+    },
+  },
+  auth: false,
+  // oxlint-disable-next-line require-yield -- The command contract requires an async generator even when it yields no output.
+  async *func(this: SentryContext, flags: LocalFlags) {
+    validateOpenHost(flags.open, flags.host);
+    const activeFilters = new Set(flags.filter);
+    const url = formatLocalServerUrl(flags.host, flags.port);
+
+    if (flags.session) {
+      const { createLocalDaemonSession, retainLocalDaemonSession } =
+        await import("./daemon.js");
+      const session = await createLocalDaemonSession({
+        maxEnvelopes: flags["max-envelopes"],
+        cwd: this.cwd,
+        host: flags.host,
+        label: flags.session || basename(this.cwd),
+        port: flags.port,
+      });
+      logger.info("Sentry Local telemetry session");
+      printLocalViewerHint(session.streamUrl, flags.format === "json");
+      logger.info(`  Session: ${bold(session.id)} (${session.label})`);
+      logger.info(
+        `  Capabilities: ${sentry`local session view ${session.id} --json`}`,
+      );
+      logger.info("Press Ctrl-C to stop.");
+      await openLocalUiIfRequested(
+        flags.open,
+        session.streamUrl,
+        session.directoryUrl,
+      );
+
+      const controller = new AbortController();
+      const stop = () => controller.abort();
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+      try {
+        await consumeSSE({
+          activeFilters,
+          quiet: flags.quiet,
+          showAttributes: flags.attributes,
+          signal: controller.signal,
+          streamUrl: session.streamUrl,
+          url: new URL(session.streamUrl).origin,
+          useJson: flags.format === "json",
+        });
+      } finally {
+        process.removeListener("SIGINT", stop);
+        process.removeListener("SIGTERM", stop);
+        await retainLocalDaemonSession(session.id);
+      }
+      return;
+    }
+
+    if (await isServerRunning(url)) {
+      await configureExistingRetention(url, flags["max-envelopes"]);
+      logger.info(`Connected to existing server at ${bold(url)}`);
+      printLocalViewerHint(url, flags.format === "json");
+      await openLocalUiIfRequested(flags.open, url);
+      if (activeFilters.size > 0) {
+        logger.info(`Filtering: ${[...activeFilters].join(", ")}`);
+      }
+      logger.info("Press Ctrl-C to stop.");
+
+      const ac = new AbortController();
+      const stop = () => ac.abort();
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+
+      try {
+        await consumeSSE({
+          url,
+          activeFilters,
+          signal: ac.signal,
+          quiet: flags.quiet,
+          useJson: flags.format === "json",
+          showAttributes: flags.attributes,
+        });
+      } catch (err: unknown) {
+        if (!(err instanceof DOMException && err.name === "AbortError")) {
+          throw err;
+        }
+      } finally {
+        process.removeListener("SIGINT", stop);
+        process.removeListener("SIGTERM", stop);
+      }
+      logger.log("Disconnected.");
+      return;
+    }
+
+    const retention = createLocalRetentionBuffer(flags["max-envelopes"]);
+    const buffer = retention.buffer;
+    const useJson = flags.format === "json";
+
+    if (!flags.quiet) {
+      const formatFn = useJson ? formatEnvelopeLinesJson : formatEnvelopeLines;
+      buffer.subscribe((container) => {
+        try {
+          for (const line of formatFn(
+            container,
+            activeFilters,
+            flags.attributes,
+          )) {
+            printLocalEventLine(line, useJson);
+          }
+        } catch (err) {
+          logger.debug(
+            `Failed to format envelope: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      });
+    }
+
+    const app = buildApp(buffer, {
+      uiActions: isLoopbackHost(flags.host),
+      retention,
+    });
+
+    const { server, port: boundPort } = await tryListen(
+      app,
+      flags.port,
+      flags.host,
+    );
+
+    const listenUrl = formatLocalServerUrl(flags.host, boundPort);
+    logger.info("Sentry Local Dev Server");
+    printLocalViewerHint(listenUrl, useJson);
+    logger.info(`  Ingest: ${bold(`${listenUrl}/stream`)}`);
+    logger.info(`  Events: ${bold(`${listenUrl}/stream`)} (SSE)`);
+    logger.info("");
+    logger.info(
+      `  Set ${bold("SENTRY_SPOTLIGHT")}=${listenUrl}/stream in your app`,
+    );
+    logger.info(
+      `  Or run: ${bold(sentry`local run -p ${boundPort} -- <your-command>`)}`,
+    );
+    if (activeFilters.size > 0) {
+      logger.info(`  Filtering: ${[...activeFilters].join(", ")}`);
+    }
+    if (useJson) {
+      logger.info("  Output: JSON (NDJSON)");
+    }
+    logger.info("");
+    logger.info("Press Ctrl-C to stop.");
+
+    await openLocalUiIfRequested(flags.open, listenUrl);
+
+    await waitForShutdown(server);
+    logger.log("Server stopped.");
+  },
+});

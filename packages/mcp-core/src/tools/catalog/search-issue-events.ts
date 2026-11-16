@@ -1,22 +1,25 @@
+import { getActiveSpan } from "@sentry/core";
 import { z } from "zod";
-import { getActiveSpan, setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
+import { UserInputError } from "../../errors";
+import { hasAgentProvider } from "../../internal/agents/provider-factory";
+import { withProviderFallback } from "../../internal/agents/provider-fallback";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
 import { ensureIssueWithinProjectConstraint } from "../../internal/tool-helpers/issue";
-import type { ServerContext } from "../../types";
 import {
   ParamOrganizationSlug,
   ParamPeriod,
-  ParamRegionUrl,
   ParamProjectSlug,
+  ParamRegionUrl,
 } from "../../schema";
-import { hasAgentProvider } from "../../internal/agents/provider-factory";
-import { withProviderFallback } from "../../internal/agents/provider-fallback";
-import { UserInputError } from "../../errors";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
+import type { ServerContext } from "../../types";
 import { searchIssueEventsAgent } from "../support/search-issue-events/agent";
-import { formatErrorResults } from "../support/search-events/formatters";
 import { RECOMMENDED_FIELDS } from "../support/search-issue-events/config";
+import {
+  buildIssueEventResults,
+  searchIssueEventsOutputSchema,
+} from "../support/search-issue-events/results";
 import { parseIssueParams } from "../support/search-issue-events/utils";
 
 function buildIssueEventSearchRepairPrompt(params: {
@@ -44,12 +47,13 @@ function buildIssueEventSearchRepairPrompt(params: {
 
 export default defineTool({
   name: "search_issue_events",
+  title: "Search Issue Events",
   skills: ["inspect", "triage"], // Available in inspect and triage skills
   requiredScopes: ["event:read"],
   description: [
     "Search and filter events within a specific issue.",
     "",
-    "Provide `query` as natural language or Sentry event search syntax. When an embedded agent is configured, it fixes filters, fields, sort, and time range before running.",
+    "Provide `query` as natural language or Sentry event search syntax. When an embedded agent is configured, it fixes filters and time range before running. Results are always newest first; fields and sort only shape the Sentry link.",
     "",
     "The tool automatically constrains results to the specified issue.",
     "",
@@ -99,7 +103,7 @@ export default defineTool({
       .string()
       .optional()
       .describe(
-        "Sort field (prefix with - for descending). Default: -timestamp",
+        "Sort for the Sentry link (prefix with - for descending). Results are always newest first. Default: -timestamp",
       ),
     period: ParamPeriod.optional(),
 
@@ -127,6 +131,7 @@ export default defineTool({
         "Include explanation of how the query was translated or repaired",
       ),
   },
+  outputSchema: searchIssueEventsOutputSchema,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -143,11 +148,11 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
 
-    setOrganizationContext(organizationSlug);
-    setTag("issue.id", issueId);
-    if (params.projectSlug) {
-      setTag("project.slug", params.projectSlug);
-    }
+    setTargetTagsAndAttributes({
+      organizationSlug,
+      projectSlug: params.projectSlug,
+      issueId,
+    });
 
     await ensureIssueWithinProjectConstraint({
       apiService,
@@ -217,13 +222,21 @@ export default defineTool({
       sortParam = parsed.sort;
       explanation = parsed.explanation;
 
-      const requestedFields = parsed.fields || [];
+      const requestedFields = parsed.fields;
       fields =
         requestedFields.length > 0 ? requestedFields : RECOMMENDED_FIELDS;
 
-      timeParams = parsed.timeRange
-        ? { ...parsed.timeRange }
-        : { statsPeriod: "14d" };
+      if (!parsed.timeRange) {
+        timeParams = { statsPeriod: "14d" };
+      } else if ("start" in parsed.timeRange) {
+        // "since X" ranges have no end; run them until now.
+        timeParams = {
+          start: parsed.timeRange.start,
+          end: parsed.timeRange.end ?? new Date().toISOString(),
+        };
+      } else {
+        timeParams = { ...parsed.timeRange };
+      }
     } else {
       // Direct mode: use provided params as-is
       query = params.query ?? "";
@@ -239,7 +252,6 @@ export default defineTool({
       issueId,
       query,
       limit: params.limit,
-      sort: sortParam,
       ...timeParams,
     });
 
@@ -286,16 +298,20 @@ export default defineTool({
       ? `Events in issue ${issueId}: ${params.query}`
       : `Events in issue ${issueId}`;
 
-    return formatErrorResults({
-      eventData: eventsResponse,
-      inputQuery: naturalLanguageContext,
-      includeExplanation: params.includeExplanation,
-      apiService,
+    return buildIssueEventResults({
+      events: eventsResponse,
       organizationSlug,
+      issueId,
+      issueUrl: apiService.getIssueUrl(organizationSlug, issueId),
       explorerUrl,
-      sentryQuery: explorerQuery,
-      fields,
-      explanation,
+      inputQuery: naturalLanguageContext,
+      query,
+      timeRange: timeParams,
+      sort: sortParam,
+      explanation: params.includeExplanation ? explanation : undefined,
+      experimentalMode: context.experimentalMode ?? false,
+      availableToolNames: context.availableToolNames,
+      directToolNames: context.directToolNames,
     });
   },
 });

@@ -1,0 +1,223 @@
+---
+title: Features
+description: Advanced features of the Sentry CLI
+---
+
+The Sentry CLI includes several features designed to streamline your workflow, especially in complex project setups.
+
+## Interactive Selection
+
+When the CLI asks you to choose an organization or project, type to filter the loaded options by name or slug. The filter appears as `/text` below the list. Matching ignores case and tolerates small typos. Use arrow keys to navigate, Enter to select, and Backspace to edit. Esc clears the filter before cancelling; Ctrl+C cancels immediately.
+
+Selectors tolerate typos in unfinished prefixes: `frone` can find `frontend-web`. Queries with one or two characters match literal text only, so `ap` finds `api` but `zz` does not find `ui`.
+
+## DSN Auto-Detection
+
+The CLI automatically detects your Sentry project from your codebase, eliminating the need to specify the target for every command. DSN detection is one part of the [resolution priority chain](../configuration/#resolution-priority) — it runs after checking for explicit arguments, environment variables, and `.sentryclirc` config files.
+
+### How It Works
+
+DSN detection follows this priority order (highest first):
+
+1. **Source code** - Explicit DSN in `Sentry.init()` calls
+2. **Environment files** - `.env.local`, `.env`, etc.
+3. **Environment variable** - `SENTRY_DSN`
+
+When a DSN is found, the CLI resolves it to your organization and project, then caches the result for fast subsequent lookups.
+
+:::tip
+For monorepos or when DSN detection picks up the wrong project, use a [`.sentryclirc` config file](../configuration/#configuration-file-sentryclirc) to pin your org/project explicitly.
+:::
+
+### Supported Languages
+
+The CLI scans source files for DSN URLs (the `https://<key>@<host>/<project-id>` pattern, so self-hosted DSNs match too) using a universal regex — no language-specific parsing is needed. Any text file with a recognized extension is scanned, including:
+
+<!-- GENERATED:START dsn-extensions -->
+| Language Family | File Extensions |
+|----------------|-----------------|
+| JavaScript/TypeScript | `.js`, `.ts`, `.jsx`, `.tsx`, `.mjs`, `.cjs`, `.astro`, `.vue`, `.svelte` |
+| Python | `.py` |
+| Go | `.go` |
+| JVM (Java, Kotlin, Scala, Groovy) | `.java`, `.kt`, `.kts`, `.scala`, `.groovy` |
+| .NET (C#, F#, VB) | `.cs`, `.fs`, `.vb` |
+| Ruby | `.rb`, `.erb` |
+| PHP | `.php` |
+| Swift/Objective-C | `.swift`, `.m`, `.mm` |
+| Rust | `.rs` |
+| Dart/Flutter | `.dart` |
+| Elixir/Erlang | `.ex`, `.exs`, `.erl` |
+| Lua | `.lua` |
+| Config files | `.json`, `.yaml`, `.yml`, `.toml`, `.xml`, `.properties`, `.config` |
+<!-- GENERATED:END dsn-extensions -->
+
+### Caching
+
+To avoid scanning your codebase on every command, the CLI caches:
+
+- **DSN location** - Which file contains the DSN
+- **Resolved project** - The org/project slugs from the API
+
+The cache is validated on each run by checking if the source file still contains the same DSN. If the DSN changes or the file is deleted, a full scan is triggered.
+
+### Usage
+
+Once your project has a DSN configured, commands automatically use it:
+
+```bash
+# Instead of:
+sentry issue list my-org/my-project
+
+# Just run:
+sentry issue list
+```
+
+The list title names the project the CLI resolved (for example,
+`Issues in my-org/my-app:`). View commands such as `sentry org view` also print a
+`Detected from <source>` hint naming the file or variable the DSN came from.
+
+## Monorepo Support & Alias System
+
+In monorepos with multiple Sentry projects, the CLI generates short aliases for each project, making it easy to work with issues across projects.
+
+### How Aliases Work
+
+When you run `sentry issue list`, the CLI:
+
+1. Scans for DSNs in monorepo directories (`packages/`, `apps/`, etc.)
+2. Generates unique short aliases for each project
+3. Caches the aliases for use with other commands
+
+Aliases are the shortest unique prefix of each project slug. For example:
+
+<!-- GENERATED:START alias-unique-prefix -->
+| Project Slug | Alias |
+|---|---|
+| `frontend` | `fr` |
+| `functions` | `fu` |
+| `backend` | `b` |
+<!-- GENERATED:END alias-unique-prefix -->
+
+For projects with a common prefix (like `spotlight-electron`, `spotlight-website`), the prefix is stripped first:
+
+<!-- GENERATED:START alias-common-prefix -->
+| Project Slug | Alias |
+|---|---|
+| `spotlight-electron` | `e` |
+| `spotlight-website` | `w` |
+| `spotlight-backend` | `b` |
+<!-- GENERATED:END alias-common-prefix -->
+
+### Using Alias-Suffix Format
+
+After running `issue list`, you can reference issues using the `alias-suffix` format.
+When several projects are listed, the `SHORT ID` column shows each issue's
+alias-suffix below its short ID (`SPOTLIGHT-ELEC-4Y` → `e-4y`):
+
+```bash
+sentry issue list
+```
+
+```bash
+# View issue using alias-suffix
+sentry issue view e-4Y
+
+# Explain using alias-suffix
+sentry issue explain w-ABC
+
+# Works with any issue command
+sentry issue plan b-XYZ
+```
+
+### Cross-Organization Support
+
+If you work with multiple organizations that have projects with the same slug, the CLI prefixes those aliases with the shortest unique org prefix:
+
+<!-- GENERATED:START alias-cross-org -->
+| Org/Project | Alias |
+|---|---|
+| `acme/api` | `a/a` |
+| `globex/api` | `g/a` |
+<!-- GENERATED:END alias-cross-org -->
+
+## Issue ID Formats
+
+The CLI accepts these formats wherever a command takes an issue:
+
+<!-- GENERATED:START issue-id-formats -->
+| Format | Example | Meaning |
+|--------|---------|---------|
+| `<numeric-id>` | `123456789` | The issue's numeric ID |
+| `<project>-<suffix>` | `cli-G` | A short ID, as shown in Sentry. A project alias from `sentry issue list` works in place of the project (`e-4Y`). Otherwise the project is looked up in the default organization, or in every accessible organization |
+| `<suffix>` | `G` | The suffix of a short ID, in the auto-detected project |
+| `<org>/<project>-<suffix>` | `my-org/cli-G` | A short ID in that organization |
+| `<org>/<project>/<id>` | `my-org/cli/CLI-G` | An issue in that project. `<id>` is a short ID, its suffix, or a numeric ID |
+| `<org>/<numeric-id>` | `my-org/123456789` | A numeric ID in that organization |
+| `<org>/<suffix>` | `my-org/G` | Always fails: it names no project. Use `<org>/<project>-<suffix>` or `<org>/<project>/<suffix>` |
+| `[<org>/]<project>#<id>` | `my-org/cli#CLI-G` | GitHub-style: `<org>/<project>#<id>` is the same as `<org>/<project>/<id>`, `<project>#<id>` as `<project>:<id>`, and `#<id>` as `<id>` |
+| `<project>:<id>` | `cli:CLI-G` | An issue in that project. `<id>` is a short ID, its suffix, or a numeric ID |
+| `[<org>/]@<selector>` | `@latest` | The top issue in the organization: `@latest` (most recent) or `@most_frequent` |
+| `https://<org>.sentry.io/issues/<id>/` | `https://my-org.sentry.io/issues/123456789/` | An issue URL or share link copied from Sentry |
+| `<text with spaces>` | `login timeout` | The one issue in the organization whose search matches the text. Quote it in the shell |
+<!-- GENERATED:END issue-id-formats -->
+
+### Alias-Suffix
+
+The short alias plus suffix, available after running `issue list`:
+
+```bash
+# First, list issues to populate the alias cache
+sentry issue list
+
+# Then use alias-suffix format
+sentry issue view e-4Y
+sentry issue explain w-ABC
+sentry issue plan b-XYZ
+```
+
+This format is especially useful in monorepos where you're working across multiple projects.
+
+## AI-Powered Analysis with Seer
+
+The CLI integrates with Sentry's Seer AI to provide root cause analysis and fix plans directly in your terminal.
+
+### Root Cause Analysis
+
+Use `sentry issue explain` to understand why an issue is happening:
+
+```bash
+sentry issue explain MYPROJECT-ABC
+```
+
+Seer analyzes:
+- Stack traces and error messages
+- Related events and patterns
+- Your codebase (via GitHub integration)
+
+And provides:
+- Detailed root cause explanation
+- Reproduction steps
+- Relevant code locations
+
+### Fix Plans
+
+After understanding the root cause, use `sentry issue plan` to get actionable fix steps:
+
+```bash
+sentry issue plan MYPROJECT-ABC
+```
+
+The plan includes:
+- Specific files to modify
+- Code changes to make
+- Implementation guidance
+
+### Requirements
+
+For Seer integration to work, you need:
+
+1. **Seer enabled** for your organization
+2. **GitHub integration** configured with repository access
+3. **Code mappings** set up to link stack frames to source files
+
+See [Sentry's Seer documentation](https://docs.sentry.io/product/issues/issue-details/ai-suggested-solution/) for setup instructions.

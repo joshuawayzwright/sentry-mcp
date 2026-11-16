@@ -2,8 +2,7 @@ import type {
   EmbeddedResource,
   ImageContent,
   TextContent,
-} from "@modelcontextprotocol/sdk/types.js";
-import { setOrganizationContext } from "../../telem/organization";
+} from "@modelcontextprotocol/server";
 import { DEFAULT_MAX_INLINE_ATTACHMENT_BYTES } from "../../api-client";
 import { bytesToBase64 } from "../../internal/blob-utils";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
@@ -16,6 +15,7 @@ import {
   ParamProjectSlug,
   ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 
 function formatMegabytes(bytes: number): string {
@@ -83,6 +83,7 @@ function formatOversizedAttachment(
 
 export default defineTool({
   name: "get_event_attachment",
+  title: "Get Event Attachment",
   skills: ["inspect"], // Only available in inspect skill
   requiredScopes: ["event:read"],
   description: [
@@ -131,7 +132,7 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
 
-    setOrganizationContext(params.organizationSlug);
+    setTargetTagsAndAttributes(params);
 
     // If attachmentId is provided, download the specific attachment
     if (params.attachmentId) {

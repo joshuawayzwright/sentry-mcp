@@ -1,4 +1,3 @@
-import { setTag } from "@sentry/core";
 import { z } from "zod";
 import type { Detector, IssueAlertRule } from "../../api-client/types";
 import { UserInputError } from "../../errors";
@@ -10,12 +9,16 @@ import {
   ParamProjectSlugOrAll,
   ParamRegionUrl,
 } from "../../schema";
-import { setOrganizationContext } from "../../telem/organization";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
-import { getAlertRuleDetails } from "../support/alert-rule-details";
+import {
+  alertRuleDetailsSchema,
+  getAlertRuleDetails,
+} from "../support/alert-rule-details";
 import {
   findExactMetricMonitorMatches,
   getMetricMonitor,
+  metricMonitorDetailsSchema,
   toMetricMonitorDetails,
 } from "../support/metric-monitors";
 import {
@@ -30,6 +33,8 @@ const AlertRuleKind = z
   .describe(
     "Which alert family to inspect. Numeric metric IDs are legacy alert-rule IDs, not monitor IDs. `all` performs an exact-name lookup.",
   );
+
+const LIST_HINT = "To list alert rules, use find_alert_rules.";
 
 type AlertRuleMatch =
   | {
@@ -48,14 +53,26 @@ function describeMatch(match: AlertRuleMatch): string {
   return `${match.kind} alert ${String(match.rule.id)} (${match.rule.name})${project}`;
 }
 
+export const getAlertRuleOutputSchema = z.object({
+  alertRule: alertRuleDetailsSchema
+    .optional()
+    .describe("Set when the match is an Issue Alert."),
+  metricMonitor: metricMonitorDetailsSchema
+    .optional()
+    .describe("Set when the match is a Metric Monitor."),
+  guidance: z.string().optional(),
+});
+
 export default defineTool({
   name: "get_alert_rule",
+  title: "Get Alert Rule",
   skills: ["inspect"],
   requiredScopes: ["org:read", "project:read"],
   description: [
-    "Get details for a Sentry alert rule.",
+    "Get details for one Sentry alert rule by ID or exact name.",
     "",
     "Use this tool when you need to inspect an alert rule's exact conditions, query, triggers, and actions before explaining or planning changes.",
+    "To list or search alert rules, use find_alert_rules instead.",
     "",
     "<examples>",
     "get_alert_rule(organizationSlug='my-org', kind='metric', ruleIdOrName='12345')",
@@ -76,13 +93,18 @@ export default defineTool({
     kind: AlertRuleKind.default("all"),
     projectSlug: ParamProjectSlugOrAll.nullable().default(null),
     ruleIdOrName: z
-      .string()
+      .string({
+        // The SDK rejects a missing value before the handler runs, so this
+        // message is the only hint for callers that wanted a list.
+        error: `Required: one Alert ID or exact name. ${LIST_HINT}`,
+      })
       .trim()
-      .min(1)
+      .min(1, `Required: one Alert ID or exact name. ${LIST_HINT}`)
       .describe(
         "An Alert ID or exact name. Metric references accept legacy numeric alert-rule IDs or detector:123 for canonical monitor IDs.",
       ),
   },
+  outputSchema: getAlertRuleOutputSchema,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -106,10 +128,7 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
-    setOrganizationContext(organizationSlug);
-    if (projectSlug) {
-      setTag("project.slug", projectSlug);
-    }
+    setTargetTagsAndAttributes({ organizationSlug, projectSlug });
 
     let match: AlertRuleMatch;
     if (params.kind === "issue") {
@@ -134,9 +153,11 @@ export default defineTool({
         ruleName: params.ruleIdOrName,
       });
       matches.push(
-        ...issueRules.map(
-          (rule): AlertRuleMatch => ({ kind: "issue", rule, projectSlug }),
-        ),
+        ...issueRules.map((rule): AlertRuleMatch => ({
+          kind: "issue",
+          rule,
+          projectSlug,
+        })),
       );
 
       const metricMonitors = await findExactMetricMonitorMatches(apiService, {
@@ -145,23 +166,21 @@ export default defineTool({
         name: params.ruleIdOrName,
       });
       matches.push(
-        ...metricMonitors.map(
-          (rule): AlertRuleMatch => ({
-            kind: "metric",
-            rule,
-            projectSlug,
-          }),
-        ),
+        ...metricMonitors.map((rule): AlertRuleMatch => ({
+          kind: "metric",
+          rule,
+          projectSlug,
+        })),
       );
 
       if (matches.length === 0) {
         throw new UserInputError(
-          `Alert rule "${params.ruleIdOrName}" was not found.`,
+          `Alert rule "${params.ruleIdOrName}" was not found. ${LIST_HINT}`,
         );
       }
       if (matches.length > 1) {
         throw new UserInputError(
-          `Multiple alert rules named "${params.ruleIdOrName}" were found: ${matches.map(describeMatch).join(", ")}. Retry with the Alert ID and kind=issue, or use get_metric_monitor_details with the monitor ID.`,
+          `Multiple alert rules named "${params.ruleIdOrName}" were found: ${matches.map(describeMatch).join(", ")}. Retry with the Alert ID and kind=issue, or use get_metric_monitor_details with the monitor ID. ${LIST_HINT}`,
         );
       }
       const [found] = matches;

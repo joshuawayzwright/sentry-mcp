@@ -1,9 +1,8 @@
-import { setTag } from "@sentry/core";
 import { z } from "zod";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
-import { setOrganizationContext } from "../../telem/organization";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import {
   metricMonitorConfigFields,
@@ -18,6 +17,7 @@ import {
 
 export default defineTool({
   name: "update_metric_monitor",
+  title: "Update Metric Monitor",
   skills: ["project-management"],
   requiredScopes: ["org:read", "project:read", "alerts:write"],
   description: [
@@ -52,8 +52,7 @@ export default defineTool({
       ...changes
     } = params;
     const projectSlug = context.constraints.projectSlug ?? requestedProject;
-    setOrganizationContext(organizationSlug);
-    if (projectSlug) setTag("project.slug", projectSlug);
+    setTargetTagsAndAttributes({ organizationSlug, projectSlug });
     const api = apiServiceFromContext(context, {
       regionUrl: regionUrl ?? undefined,
     });

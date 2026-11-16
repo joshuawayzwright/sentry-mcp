@@ -2,7 +2,7 @@ import { z } from "zod";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
-import { setOrganizationContext } from "../../telem/organization";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import {
   getMetricMonitor,
@@ -11,6 +11,7 @@ import {
 
 export default defineTool({
   name: "delete_metric_monitor",
+  title: "Delete Metric Monitor",
   skills: ["project-management"],
   requiredScopes: ["org:read", "project:read", "alerts:write"],
   description: [
@@ -32,7 +33,7 @@ export default defineTool({
     const api = apiServiceFromContext(context, {
       regionUrl: params.regionUrl ?? undefined,
     });
-    setOrganizationContext(params.organizationSlug);
+    setTargetTagsAndAttributes(params);
     await getMetricMonitor(api, {
       ...params,
       scopedProjectSlug: context.constraints.projectSlug,

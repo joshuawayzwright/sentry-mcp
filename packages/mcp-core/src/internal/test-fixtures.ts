@@ -265,10 +265,15 @@ export class EventBuilder {
     return this;
   }
 
+  withDateCreated(dateCreated: string | undefined): this {
+    this.event.dateCreated = dateCreated;
+    return this;
+  }
+
   build(): Event {
     // Cast is safe here because we ensure MutableEvent has all fields needed
     // for either ErrorEvent or TransactionEvent based on the type field
-    return { ...this.event } as Event;
+    return { ...this.event };
   }
 }
 

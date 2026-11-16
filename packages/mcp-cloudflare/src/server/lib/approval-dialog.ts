@@ -2,9 +2,7 @@ import type {
   AuthRequest,
   ClientInfo,
 } from "@cloudflare/workers-oauth-provider";
-import skillDefinitions, {
-  type SkillDefinition,
-} from "@sentry/mcp-core/skillDefinitions";
+import skillDefinitions from "@sentry/mcp-core/skillDefinitions";
 import { logError, logIssue, logWarn } from "@sentry/mcp-core/telem/logging";
 import {
   type OAuthState,
@@ -19,9 +17,7 @@ const ONE_YEAR_IN_SECONDS = 31536000;
 const MAX_SKILL_PREFERENCE_CLIENTS = 10;
 // Hosted OAuth approvals only mint active skills. Deprecated skills may still
 // work for existing grants or explicit stdio use, but not through this form.
-const APPROVABLE_SKILLS = (skillDefinitions as SkillDefinition[]).filter(
-  (skill) => !skill.deprecated,
-);
+const APPROVABLE_SKILLS = skillDefinitions.filter((skill) => !skill.deprecated);
 const APPROVABLE_SKILL_IDS = new Set(
   APPROVABLE_SKILLS.map((skill) => skill.id),
 );
@@ -41,7 +37,7 @@ async function importKey(secret: string): Promise<CryptoKey> {
     );
   }
   const enc = new TextEncoder();
-  return crypto.subtle.importKey(
+  return await crypto.subtle.importKey(
     "raw",
     enc.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
@@ -64,7 +60,7 @@ async function signData(key: CryptoKey, data: string): Promise<string> {
     enc.encode(data),
   );
   // Convert ArrayBuffer to hex string
-  return Array.from(new Uint8Array(signatureBuffer))
+  return [...new Uint8Array(signatureBuffer)]
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
@@ -203,9 +199,11 @@ async function getApprovedClientsFromCookie(
       });
       return null;
     }
-    return approvedClients as string[];
+    return approvedClients;
   } catch (e) {
-    logIssue(new Error(`Error parsing cookie payload: ${e}`, { cause: e }));
+    logIssue(
+      new Error(`Error parsing cookie payload: ${String(e)}`, { cause: e }),
+    );
     return null; // JSON parsing failed
   }
 }
@@ -213,14 +211,14 @@ async function getApprovedClientsFromCookie(
 function filterApprovableSkillIds(input: unknown): string[] {
   if (!Array.isArray(input)) return [];
 
-  return Array.from(
-    new Set(
+  return [
+    ...new Set(
       input.filter(
         (skill): skill is string =>
           typeof skill === "string" && APPROVABLE_SKILL_IDS.has(skill),
       ),
     ),
-  );
+  ];
 }
 
 /**
@@ -452,15 +450,8 @@ export async function renderApprovalDialog(
   request: Request,
   options: ApprovalDialogOptions,
 ): Promise<Response> {
-  const {
-    client,
-    server,
-    scope,
-    redirectUri,
-    state,
-    cookieSecret,
-    defaultSkills,
-  } = options;
+  const { client, scope, redirectUri, state, cookieSecret, defaultSkills } =
+    options;
   const defaultSkillIds =
     defaultSkills === undefined
       ? new Set(APPROVABLE_SKILLS.map((skill) => skill.id))
@@ -1128,9 +1119,9 @@ export async function parseRedirectApproval(
     (await getApprovedClientsFromCookie(cookieHeader, cookieSecret)) || [];
 
   // Add the newly approved client ID (avoid duplicates)
-  const updatedApprovedClients = Array.from(
-    new Set([...existingApprovedClients, clientId]),
-  );
+  const updatedApprovedClients = [
+    ...new Set([...existingApprovedClients, clientId]),
+  ];
 
   // Sign the updated approval list
   const payload = JSON.stringify(updatedApprovedClients);

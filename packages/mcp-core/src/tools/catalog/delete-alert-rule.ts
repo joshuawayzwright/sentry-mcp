@@ -7,12 +7,13 @@ import {
   ParamProjectSlug,
   ParamRegionUrl,
 } from "../../schema";
-import { setOrganizationContext } from "../../telem/organization";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { validateAlertRuleProjectScope } from "../support/alert-rule-connections";
 
 export default defineTool({
   name: "delete_alert_rule",
+  title: "Delete Alert Rule",
   skills: ["project-management"],
   requiredScopes: ["org:read", "project:read", "alerts:write"],
   description: [
@@ -48,7 +49,7 @@ export default defineTool({
     const api = apiServiceFromContext(context, {
       regionUrl: params.regionUrl ?? undefined,
     });
-    setOrganizationContext(params.organizationSlug);
+    setTargetTagsAndAttributes(params);
     await validateAlertRuleProjectScope(api, {
       organizationSlug: params.organizationSlug,
       ruleId: params.ruleId,

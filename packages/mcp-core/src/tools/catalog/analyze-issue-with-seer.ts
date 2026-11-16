@@ -1,37 +1,40 @@
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
+import { ApiError, ApiServerError } from "../../api-client/index";
+import { retryWithBackoff } from "../../internal/fetch-utils";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
 import {
-  parseIssueParams,
   assertIssueWithinProjectConstraint,
+  parseIssueParams,
 } from "../../internal/tool-helpers/issue";
 import {
-  getStatusDisplayName,
-  isTerminalStatus,
+  getActiveAutofixTodo,
+  getFailureReasonGuidance,
   getHumanInterventionGuidance,
   getOutputForAutofixRun,
-  wrapSeerContent,
-  getActiveAutofixTodo,
+  getSeerPaymentRequiredMessage,
+  getSeerSetupRequiredMessage,
   getSeerUnsupportedIssueMessage,
+  getStatusDisplayName,
   isSeerSupportedIssue,
+  isTerminalStatus,
+  SEER_INITIAL_RETRY_DELAY,
+  SEER_MAX_RETRIES,
   SEER_POLLING_INTERVAL,
   SEER_TIMEOUT,
-  SEER_MAX_RETRIES,
-  SEER_INITIAL_RETRY_DELAY,
 } from "../../internal/tool-helpers/seer";
-import { retryWithBackoff } from "../../internal/fetch-utils";
-import type { ServerContext } from "../../types";
-import { ApiError, ApiServerError } from "../../api-client/index";
 import {
-  ParamOrganizationSlug,
-  ParamRegionUrl,
   ParamIssueShortId,
   ParamIssueUrl,
+  ParamOrganizationSlug,
+  ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
+import type { ServerContext } from "../../types";
 
 export default defineTool({
   name: "analyze_issue_with_seer",
+  title: "Analyze Issue with Seer",
   skills: ["seer"], // Only available in seer skill
   requiredScopes: [], // No Sentry API scopes required - authorization via 'seer' skill
   description: [
@@ -70,7 +73,8 @@ export default defineTool({
     "",
     "<hints>",
     "- Only use when the user explicitly requests analysis or you cannot determine the root cause from issue details alone",
-    "- Seer Autofix does not support metric alert issues (issueCategory: metric); use get_issue_details and search_events instead",
+    "- Seer Autofix does not support metric alert issues (issueCategory: metric); use get_issue_details and search_metrics or search_traces instead",
+    "- Starting a new analysis requires a GitHub or GitLab integration and repositories connected to the issue's project; without them the tool reports that no analysis started",
     "- If the user provides an issueUrl, extract it and use that parameter alone",
     "- The analysis includes actual code snippets and fixes, not just error descriptions",
     "- Results are cached - subsequent calls return instantly",
@@ -102,11 +106,11 @@ export default defineTool({
         issueUrl: params.issueUrl,
       });
 
-    setOrganizationContext(orgSlug);
+    setTargetTagsAndAttributes({ organizationSlug: orgSlug });
 
     const issue = await apiService.getIssue({
       organizationSlug: orgSlug,
-      issueId: parsedIssueId!,
+      issueId: parsedIssueId,
     });
 
     assertIssueWithinProjectConstraint({
@@ -125,7 +129,7 @@ export default defineTool({
       () =>
         apiService.getAutofixState({
           organizationSlug: orgSlug,
-          issueId: parsedIssueId!,
+          issueId: parsedIssueId,
         }),
       {
         maxRetries: SEER_MAX_RETRIES,
@@ -139,14 +143,46 @@ export default defineTool({
       },
     );
 
-    // Step 2: Start analysis if none exists
-    if (!autofixState.autofix) {
-      output += `Starting new analysis...\n\n`;
-      const startResult = await apiService.startAutofix({
-        organizationSlug: orgSlug,
-        issueId: parsedIssueId,
-        instruction: params.instruction,
-      });
+    // Step 2: Start analysis if none exists or the last one failed, so a run
+    // that stopped (e.g. out of credits) can be retried.
+    const previousRun = autofixState.autofix;
+    if (!previousRun || previousRun.status === "error") {
+      let startResult: Awaited<ReturnType<typeof apiService.startAutofix>>;
+      try {
+        startResult = await apiService.startAutofix({
+          organizationSlug: orgSlug,
+          issueId: parsedIssueId,
+          instruction: params.instruction,
+        });
+      } catch (error) {
+        // Sentry answers 402 before starting a run when the org is out of
+        // Seer credits or quota.
+        if (error instanceof ApiError && error.status === 402) {
+          output += `## Analysis Not Started\n\n${getSeerPaymentRequiredMessage(error.responseBody)}\n`;
+          // The failed run may already hold paid-for analysis, e.g. a root
+          // cause found before the org ran out of credits.
+          const previousOutput = previousRun
+            ? getOutputForAutofixRun(previousRun)
+            : "";
+          if (previousRun && previousOutput) {
+            output += `\nThe previous analysis (Run ID: ${previousRun.run_id}) failed before it finished. Its partial results:\n\n${previousOutput}`;
+          }
+          return output;
+        }
+        // Sentry answers 409 with a setup code when the org has no SCM
+        // integration or the project has no linked repositories.
+        if (error instanceof ApiError && error.status === 409) {
+          const setupMessage = getSeerSetupRequiredMessage(error.responseBody);
+          if (setupMessage) {
+            output += `## Analysis Not Started\n\n${setupMessage}\n`;
+            return output;
+          }
+        }
+        throw error;
+      }
+      output += previousRun
+        ? `Previous analysis (Run ID: ${previousRun.run_id}) failed, starting a new one...\n\n`
+        : `Starting new analysis...\n\n`;
       output += `Analysis started with Run ID: ${startResult.run_id}\n\n`;
 
       // Give it a moment to initialize
@@ -157,7 +193,7 @@ export default defineTool({
         () =>
           apiService.getAutofixState({
             organizationSlug: orgSlug,
-            issueId: parsedIssueId!,
+            issueId: parsedIssueId,
           }),
         {
           maxRetries: SEER_MAX_RETRIES,
@@ -171,19 +207,13 @@ export default defineTool({
         },
       );
     } else {
-      output += `Found existing analysis (Run ID: ${autofixState.autofix.run_id})\n\n`;
+      output += `Found existing analysis (Run ID: ${previousRun.run_id})\n\n`;
 
-      // Check if existing analysis is already complete
-      const existingStatus = autofixState.autofix.status;
+      // Completed and waiting-for-input runs are returned as they are
+      const existingStatus = previousRun.status;
       if (isTerminalStatus(existingStatus)) {
-        // Return results immediately, no polling needed
         output += `## Analysis ${getStatusDisplayName(existingStatus)}\n\n`;
-        output += autofixState.formatted?.content
-          ? wrapSeerContent(
-              autofixState.formatted.content,
-              autofixState.autofix.run_id,
-            )
-          : getOutputForAutofixRun(autofixState.autofix);
+        output += getOutputForAutofixRun(previousRun);
 
         if (existingStatus !== "completed") {
           output += `\n**Status**: ${existingStatus}\n`;
@@ -216,15 +246,13 @@ export default defineTool({
       // Check if completed (terminal state)
       if (isTerminalStatus(status)) {
         output += `## Analysis ${getStatusDisplayName(status)}\n\n`;
-        output += autofixState.formatted?.content
-          ? wrapSeerContent(
-              autofixState.formatted.content,
-              autofixState.autofix.run_id,
-            )
-          : getOutputForAutofixRun(autofixState.autofix);
+        output += getOutputForAutofixRun(autofixState.autofix);
 
         if (status !== "completed") {
           output += `\n**Status**: ${status}\n`;
+          output += getFailureReasonGuidance(
+            autofixState.autofix.failure_reason,
+          );
           output += getHumanInterventionGuidance(status);
         }
 
@@ -251,7 +279,7 @@ export default defineTool({
           () =>
             apiService.getAutofixState({
               organizationSlug: orgSlug,
-              issueId: parsedIssueId!,
+              issueId: parsedIssueId,
             }),
           {
             maxRetries: SEER_MAX_RETRIES,
@@ -290,12 +318,7 @@ export default defineTool({
     // Show current progress
     if (autofixState.autofix) {
       output += `**Current Status**: ${getStatusDisplayName(autofixState.autofix.status)}\n\n`;
-      output += autofixState.formatted?.content
-        ? wrapSeerContent(
-            autofixState.formatted.content,
-            autofixState.autofix.run_id,
-          )
-        : getOutputForAutofixRun(autofixState.autofix);
+      output += getOutputForAutofixRun(autofixState.autofix);
     }
 
     // Timeout reached

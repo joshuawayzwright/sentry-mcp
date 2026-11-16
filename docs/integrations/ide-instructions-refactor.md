@@ -2,6 +2,8 @@
 
 ## Status: ✅ Complete
 
+> **Update:** The website no longer has a Stdio transport. The CLI flow (`?transport=cli`, `sentry mcp`) replaced it, and `stdio-setup.tsx` was removed; `?transport=stdio` links now open the CLI flow. The npx `@sentry/mcp-server` setup is documented in the README.
+
 This document describes the refactoring of IDE integration instructions to improve code maintainability and add URL state persistence.
 
 ## Problem Statement
@@ -66,6 +68,7 @@ export function ClaudeCodeInstructions({ transport }: InstructionProps) {
 ```
 
 **Benefits:**
+
 - All Claude Code instructions (both transports) in one file
 - Easy to maintain - single source of truth for each IDE
 - Clear ownership - one file per IDE
@@ -96,10 +99,12 @@ useEffect(() => {
 ```
 
 **URL Format:**
+
 - `?ide=claude-code&transport=cloud` - Cloud instructions for Claude Code
 - `?ide=cursor&transport=stdio` - Stdio instructions for Cursor
 
 **Default Values:**
+
 - `ide=claude-code` (most popular)
 - `transport=cloud` (recommended for new users)
 
@@ -133,14 +138,17 @@ export default function InstallTabs({
   }
 
   // Call appropriate callback
-  const setActive = React.useCallback((next: number) => {
-    const tabId = items[next]?.props.id;
-    if (selectedTab && onTabChange && tabId) {
-      onTabChange(tabId);  // String-based control
-    } else {
-      onChange?.(next);    // Numeric control
-    }
-  }, [selectedTab, onTabChange, onChange, items]);
+  const setActive = React.useCallback(
+    (next: number) => {
+      const tabId = items[next]?.props.id;
+      if (selectedTab && onTabChange && tabId) {
+        onTabChange(tabId); // String-based control
+      } else {
+        onChange?.(next); // Numeric control
+      }
+    },
+    [selectedTab, onTabChange, onChange, items],
+  );
 }
 ```
 
@@ -164,12 +172,14 @@ export default function InstallTabs({
 ### 1. `stdio-setup.tsx`
 
 **Changes:**
+
 - Added imports for all IDE instruction components
 - Added `StdioSetupTabsProps` interface with `selectedIde` and `onIdeChange` props
 - Replaced inline Tab content with `<IDEInstructions transport="stdio" />`
 - Removed unused imports
 
 **Before:**
+
 ```typescript
 <Tab id="claude-code" title="Claude Code">
   <ol>
@@ -180,6 +190,7 @@ export default function InstallTabs({
 ```
 
 **After:**
+
 ```typescript
 <Tab id="claude-code" title="Claude Code">
   <ClaudeCodeInstructions transport="stdio" />
@@ -189,6 +200,7 @@ export default function InstallTabs({
 ### 2. `remote-setup.tsx`
 
 **Changes:**
+
 - Added imports for all IDE instruction components
 - Added `RemoteSetupTabsProps` interface
 - Replaced inline Tab content with `<IDEInstructions transport="cloud" />`
@@ -197,6 +209,7 @@ export default function InstallTabs({
 ### 3. `getting-started.tsx`
 
 **Changes:**
+
 - Added URL-based state management for `ide` parameter
 - Modified `stdio` state to read from URL (`transport` param)
 - Added `useEffect` to update URL when IDE or transport changes
@@ -205,6 +218,7 @@ export default function InstallTabs({
 ### 4. `install-tabs.tsx`
 
 **Changes:**
+
 - Added `selectedTab?: string` and `onTabChange?: (tabId: string) => void` props
 - Modified active index calculation to support both numeric and string-based control
 - Updated `setActive` callback to call `onTabChange` with tab ID string
@@ -278,12 +292,14 @@ const iconsByID: Record<string, React.ReactNode> = {
 ## Benefits Summary
 
 ### For Developers
+
 - ✅ **Easier IDE Management**: Create one file instead of editing two separate files
 - ✅ **Better Code Organization**: All IDE instructions co-located
 - ✅ **Reduced Duplication**: Single source of truth per IDE
 - ✅ **Clearer Ownership**: One file per IDE makes changes obvious
 
 ### For Users
+
 - ✅ **URL Sharing**: Can share links like `?ide=cursor&transport=stdio`
 - ✅ **State Preservation**: IDE selection maintained when switching Cloud ↔ Stdio
 - ✅ **Familiar UI**: No changes to the existing interface
@@ -302,6 +318,7 @@ const iconsByID: Record<string, React.ReactNode> = {
 ## Migration Notes
 
 This refactor is **100% backward compatible**:
+
 - InstallTabs still supports numeric index control (used elsewhere)
 - No breaking changes to component APIs
 - All existing functionality preserved
@@ -310,6 +327,7 @@ This refactor is **100% backward compatible**:
 ## Future Improvements
 
 Potential future enhancements:
+
 1. **Analytics**: Track which IDE/transport combinations are popular
 2. **IDE Detection**: Auto-detect user's IDE and pre-select it (if worth complexity)
 3. **Favorites**: Allow users to mark favorite IDEs for quick access

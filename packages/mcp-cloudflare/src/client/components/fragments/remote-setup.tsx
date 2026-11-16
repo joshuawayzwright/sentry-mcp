@@ -8,14 +8,12 @@ import { CursorInstructions } from "./instructions/cursor";
 import { FxInstructions } from "./instructions/fx";
 import { GeminiInstructions } from "./instructions/gemini";
 import { OpenCodeInstructions } from "./instructions/opencode";
+import { PiInstructions } from "./instructions/pi";
 import { VSCodeInstructions } from "./instructions/vscode";
 import { WarpInstructions } from "./instructions/warp";
 import { ZedInstructions } from "./instructions/zed";
 
-const mcpServerName = import.meta.env.DEV ? "sentry-dev" : "sentry";
-
 export default function RemoteSetup() {
-  const endpoint = new URL("/mcp", window.location.href).href;
   return (
     <>
       <Prose className="mb-6">
@@ -83,6 +81,10 @@ export function RemoteSetupTabs({
 
       <Tab id="opencode" title="OpenCode">
         <OpenCodeInstructions transport="cloud" />
+      </Tab>
+
+      <Tab id="pi" title="Pi">
+        <PiInstructions transport="cloud" />
       </Tab>
 
       <Tab id="vscode" title="VSCode">

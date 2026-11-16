@@ -2,14 +2,13 @@
 // transcript projection and keeps detail output chronological and debugger
 // oriented instead of mirroring every raw span attribute.
 import { z } from "zod";
-import { setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
+import type { AIConversationSpan, SentryApiService } from "../../api-client";
+import { UserInputError } from "../../errors";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
 import { ParamOrganizationSlug, ParamRegionUrl } from "../../schema";
-import { UserInputError } from "../../errors";
-import type { AIConversationSpan, SentryApiService } from "../../api-client";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 
 type ToolCall = {
@@ -564,7 +563,7 @@ function buildMessageEvents(span: AIConversationSpan): ConversationMessage[] {
     });
   } else if (events.length > 0) {
     events[events.length - 1] = {
-      ...events[events.length - 1]!,
+      ...events[events.length - 1],
       metadata,
       genAi,
     };
@@ -661,6 +660,7 @@ function buildConversationArtifact(
 
 export default defineTool({
   name: "get_agent_conversation_details",
+  title: "Get Agent Conversation Details",
   skills: ["inspect", "triage", "seer"],
   requiredScopes: ["event:read", "project:read"],
 
@@ -704,8 +704,10 @@ export default defineTool({
   outputSchema: aiConversationDetailsOutputSchema,
 
   async handler(params, context: ServerContext) {
-    setOrganizationContext(params.organizationSlug);
-    setTag("ai_conversation.id", params.conversationId);
+    setTargetTagsAndAttributes({
+      organizationSlug: params.organizationSlug,
+      aiConversationId: params.conversationId,
+    });
 
     if ((params.start && !params.end) || (!params.start && params.end)) {
       throw new UserInputError("`start` and `end` must be provided together.");

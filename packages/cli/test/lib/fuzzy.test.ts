@@ -1,0 +1,361 @@
+/**
+ * Fuzzy Matching Tests
+ *
+ * Property-based and unit tests for Levenshtein distance and fuzzyMatch.
+ * Core invariants are tested via properties; edge cases and specific
+ * output formatting are tested via unit tests.
+ */
+
+import { array, assert as fcAssert, property, string } from "fast-check";
+import { describe, expect, test } from "vitest";
+import {
+  fuzzyMatch,
+  fuzzyMatchSegments,
+  levenshtein,
+} from "../../src/lib/fuzzy.js";
+import { DEFAULT_NUM_RUNS } from "../model-based/helpers.js";
+
+// Short strings to keep Levenshtein computation fast in property tests
+const shortStringArb = string({ minLength: 0, maxLength: 20 });
+
+describe("property: levenshtein", () => {
+  test("identity: distance to self is always 0", () => {
+    fcAssert(
+      property(shortStringArb, (s) => {
+        expect(levenshtein(s, s)).toBe(0);
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("symmetry: levenshtein(a, b) === levenshtein(b, a)", () => {
+    fcAssert(
+      property(shortStringArb, shortStringArb, (a, b) => {
+        expect(levenshtein(a, b)).toBe(levenshtein(b, a));
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("upper bound: distance <= max(a.length, b.length)", () => {
+    fcAssert(
+      property(shortStringArb, shortStringArb, (a, b) => {
+        const dist = levenshtein(a, b);
+        expect(dist).toBeLessThanOrEqual(Math.max(a.length, b.length));
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("non-negative: distance is always >= 0", () => {
+    fcAssert(
+      property(shortStringArb, shortStringArb, (a, b) => {
+        expect(levenshtein(a, b)).toBeGreaterThanOrEqual(0);
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("empty string: distance to empty is the string length", () => {
+    fcAssert(
+      property(shortStringArb, (s) => {
+        expect(levenshtein(s, "")).toBe(s.length);
+        expect(levenshtein("", s)).toBe(s.length);
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("triangle inequality: d(a,c) <= d(a,b) + d(b,c)", () => {
+    fcAssert(
+      property(shortStringArb, shortStringArb, shortStringArb, (a, b, c) => {
+        const dac = levenshtein(a, c);
+        const dab = levenshtein(a, b);
+        const dbc = levenshtein(b, c);
+        expect(dac).toBeLessThanOrEqual(dab + dbc);
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+});
+
+describe("levenshtein: unit tests", () => {
+  test("known distances", () => {
+    expect(levenshtein("kitten", "sitting")).toBe(3);
+    expect(levenshtein("saturday", "sunday")).toBe(3);
+    expect(levenshtein("", "")).toBe(0);
+    expect(levenshtein("a", "b")).toBe(1);
+    expect(levenshtein("abc", "abc")).toBe(0);
+  });
+});
+
+describe("fuzzyMatch: unit tests", () => {
+  const candidates = ["sentry", "entry", "notary", "sentinel", "send", "zen"];
+
+  test("empty partial returns all candidates sorted", () => {
+    const result = fuzzyMatch("", candidates);
+    expect(result).toEqual([...candidates].sort());
+  });
+
+  test("exact match ranks first", () => {
+    const result = fuzzyMatch("sentry", candidates);
+    expect(result[0]).toBe("sentry");
+  });
+
+  test("prefix matches rank high", () => {
+    const result = fuzzyMatch("sen", candidates);
+    expect(result).toContain("sentry");
+    expect(result).toContain("sentinel");
+    expect(result).toContain("send");
+    // "sen" is a prefix of all three
+    expect(result.indexOf("sentry")).toBeLessThan(result.length);
+  });
+
+  test("contains matches are included", () => {
+    const result = fuzzyMatch("try", candidates);
+    // "try" is contained in "sentry" and "entry"
+    expect(result).toContain("sentry");
+    expect(result).toContain("entry");
+  });
+
+  test("fuzzy match on typo: senry → sentry", () => {
+    // "senry" has length 5, threshold = max(2, floor(5/3)) = 2
+    // levenshtein("senry", "sentry") = 1 (insert 't')
+    const result = fuzzyMatch("senry", candidates);
+    expect(result).toContain("sentry");
+  });
+
+  test("fuzzy match on typo: entry → sentry, entry (exact + fuzzy)", () => {
+    // "entry" exact matches "entry" and is distance 2 from "sentry"
+    const result = fuzzyMatch("entry", candidates);
+    expect(result[0]).toBe("entry"); // exact match first
+    expect(result).toContain("sentry"); // fuzzy match (distance 2)
+  });
+
+  test("case-insensitive matching", () => {
+    const result = fuzzyMatch("SENTRY", candidates);
+    expect(result[0]).toBe("sentry");
+  });
+
+  test("maxResults limits output", () => {
+    const result = fuzzyMatch("", candidates, { maxResults: 2 });
+    expect(result.length).toBe(2);
+  });
+
+  test("no matches returns empty array", () => {
+    const result = fuzzyMatch("zzzzzzzzz", candidates);
+    expect(result).toEqual([]);
+  });
+
+  test("prefix matches come before contains matches", () => {
+    const items = ["prefix-match", "contains-prefix", "no-match"];
+    const result = fuzzyMatch("prefix", items);
+    expect(result.indexOf("prefix-match")).toBeLessThan(
+      result.indexOf("contains-prefix"),
+    );
+  });
+});
+
+describe("fuzzyMatch: search mode", () => {
+  test.each(["frone", "froont", "frnt"])(
+    "matches an unfinished prefix with an edit: %s",
+    (query) => {
+      expect(fuzzyMatch(query, ["frontend-web"], { mode: "search" })).toEqual([
+        "frontend-web",
+      ]);
+    },
+  );
+
+  test("preserves full-name typos while allowing incomplete typo prefixes", () => {
+    expect(fuzzyMatch("isseu", ["issue"], { mode: "search" })).toEqual([
+      "issue",
+    ]);
+    expect(fuzzyMatch("frone", ["frontend-web"])).toEqual([]);
+    expect(fuzzyMatch("frone", ["frontend-web"], { mode: "search" })).toEqual([
+      "frontend-web",
+    ]);
+  });
+
+  test("ranks literal matches before typo prefixes and respects the result limit", () => {
+    const candidates = ["frnntend-web", "team-frontend", "frontend", "front"];
+    const expected = ["front", "frontend", "team-frontend", "frnntend-web"];
+    expect(fuzzyMatch("FRONT", candidates, { mode: "search" })).toEqual(
+      expected,
+    );
+    expect(
+      fuzzyMatch("FRONT", candidates, { mode: "search", maxResults: 2 }),
+    ).toEqual(expected.slice(0, 2));
+  });
+
+  test("matches typos at word starts, but not mid-word", () => {
+    expect(
+      fuzzyMatch("fornt", ["team-frontend-web", "storefront"], {
+        mode: "search",
+      }),
+    ).toEqual(["team-frontend-web"]);
+  });
+
+  test("matches a typo across words of a slug", () => {
+    expect(
+      fuzzyMatch("sentyr-javascrpt", ["sentry-javascript", "sentry-java"], {
+        mode: "search",
+      }),
+    ).toEqual(["sentry-javascript"]);
+  });
+
+  test("matches two extra letters in a longer typo", () => {
+    expect(
+      fuzzyMatch("chheckkout", ["checkout-service-api"], { mode: "search" }),
+    ).toEqual(["checkout-service-api"]);
+  });
+
+  test("falls back to full-name typos past the search typo limit", () => {
+    expect(fuzzyMatch("committers", ["commits"], { mode: "search" })).toEqual([
+      "commits",
+    ]);
+  });
+
+  test("needs four characters for a typo", () => {
+    expect(fuzzyMatch("isu", ["sui"], { mode: "search" })).toEqual([]);
+  });
+
+  test("treats a camelCase capital as a word start", () => {
+    expect(fuzzyMatch("curnet", ["getCurrentHub"], { mode: "search" })).toEqual(
+      ["getCurrentHub"],
+    );
+    expect(
+      fuzzyMatch("iss", ["isolationscope", "isolationScope"], {
+        mode: "search",
+      }),
+    ).toEqual(["isolationScope", "isolationscope"]);
+  });
+
+  test("matches a query that was lowercased before the call", () => {
+    // "İ".toLowerCase() is "i" plus a combining dot, two code units.
+    expect(
+      fuzzyMatch("İs".toLowerCase(), ["İstanbul"], { mode: "search" }),
+    ).toEqual(["İstanbul"]);
+    expect(
+      fuzzyMatch("iss", ["İsolationscope", "İsolationScope"], {
+        mode: "search",
+      }),
+    ).toEqual(["İsolationScope", "İsolationscope"]);
+  });
+
+  test("ranks a tight scatter over a typo over a loose scatter", () => {
+    expect(
+      fuzzyMatch(
+        "bategon",
+        ["bar-saturated-energy-gold-on", "betegon", "bat-egon"],
+        { mode: "search" },
+      ),
+    ).toEqual(["bat-egon", "betegon", "bar-saturated-energy-gold-on"]);
+  });
+
+  test("matches letters in order but apart, after contains matches", () => {
+    expect(fuzzyMatch("fw", ["frontend-web"])).toEqual([]);
+    expect(
+      fuzzyMatch("fw", ["frontend-web", "team-fw", "web-front"], {
+        mode: "search",
+      }),
+    ).toEqual(["team-fw", "frontend-web"]);
+  });
+});
+
+describe("fuzzyMatchSegments", () => {
+  const fields = [
+    "span.op",
+    "span.duration",
+    "span.description",
+    "http.method",
+    "span",
+  ];
+
+  test("matches the typed segment within the candidate's, never past it", () => {
+    expect(fuzzyMatchSegments("span.d", fields)).toEqual([
+      "span.description",
+      "span.duration",
+    ]);
+    expect(fuzzyMatchSegments("span.d", ["span.op"])).toEqual([]);
+  });
+
+  test("tolerates a typo within a segment", () => {
+    expect(fuzzyMatchSegments("span.duraton", fields)).toEqual([
+      "span.duration",
+    ]);
+    expect(fuzzyMatchSegments("spn.duration", fields)).toEqual([
+      "span.duration",
+    ]);
+  });
+
+  test("a segment typed in full matches the candidates under it", () => {
+    expect(fuzzyMatchSegments("span", fields)).toEqual([
+      "span",
+      "span.description",
+      "span.duration",
+      "span.op",
+    ]);
+    expect(fuzzyMatchSegments("span.", fields)).toEqual([
+      "span.description",
+      "span.duration",
+      "span.op",
+    ]);
+  });
+
+  test("needs a candidate segment for each typed one", () => {
+    expect(fuzzyMatchSegments("span.op.x", fields)).toEqual([]);
+    expect(fuzzyMatchSegments("duration", fields)).toEqual([]);
+  });
+
+  test("returns every candidate, sorted, for an empty partial", () => {
+    expect(fuzzyMatchSegments("", ["b.a", "a.b"])).toEqual(["a.b", "b.a"]);
+  });
+});
+
+describe("property: fuzzyMatch", () => {
+  test("exact candidate is always in the result", () => {
+    const candidatesArb = array(shortStringArb, {
+      minLength: 1,
+      maxLength: 10,
+    });
+    fcAssert(
+      property(candidatesArb, (candidates) => {
+        // Pick the first candidate as partial
+        const partial = candidates[0];
+        const result = fuzzyMatch(partial, candidates);
+        expect(result).toContain(partial);
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("empty partial returns all candidates", () => {
+    const candidatesArb = array(shortStringArb, {
+      minLength: 0,
+      maxLength: 10,
+    });
+    fcAssert(
+      property(candidatesArb, (candidates) => {
+        const result = fuzzyMatch("", candidates);
+        expect(result.length).toBe(candidates.length);
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("result is a subset of candidates", () => {
+    const candidatesArb = array(shortStringArb, {
+      minLength: 0,
+      maxLength: 10,
+    });
+    fcAssert(
+      property(shortStringArb, candidatesArb, (partial, candidates) => {
+        const result = fuzzyMatch(partial, candidates);
+        for (const r of result) {
+          expect(candidates).toContain(r);
+        }
+      }),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+});

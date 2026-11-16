@@ -11,7 +11,7 @@ The `search_issues` tool uses an embedded AI agent to translate natural language
 - **Handler**: `handler.ts` - MCP tool definition and orchestration
 - **Agent**: `agent.ts` - AI translation logic
 - **Config**: `config.ts` - System prompts and settings
-- **Formatters**: `formatters.ts` - Result formatting
+- **Results**: `results.ts` - Structured result payload and output schema
 
 ## Agent Tools
 
@@ -44,6 +44,6 @@ search_issues({
   organizationSlug: "my-org",
   query: "critical bugs from last week",
   limit: 25,
-  includeExplanation: true
-})
+  includeExplanation: true,
+});
 ```

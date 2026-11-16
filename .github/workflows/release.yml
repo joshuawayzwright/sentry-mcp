@@ -3,15 +3,30 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: Version bump type
+      product:
+        description: Product to release
         required: true
         type: choice
-        default: minor
+        default: cli
         options:
+          - cli
+          - logger
+      bump:
+        description: "Version bump: auto (from commits), pre (next prerelease), or an explicit bump type"
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - pre
           - patch
           - minor
           - major
+      version:
+        description: Exact version to release, such as 1.2.3 (overrides bump)
+        required: false
+        type: string
+        default: ""
       force:
         description: Force release (bypass blockers)
         required: false
@@ -31,13 +46,13 @@ jobs:
           private-key: ${{ secrets.SENTRY_RELEASE_BOT_PRIVATE_KEY }}
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           token: ${{ steps.token.outputs.token }}
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -46,19 +61,39 @@ jobs:
         with:
           run_install: false
 
-      - name: Calculate version
-        id: version
+      - name: Resolve release workspace
+        id: release
         env:
-          BUMP: ${{ inputs.bump }}
+          PRODUCT: ${{ inputs.product }}
         run: |
-          CURRENT=$(node -p "require('./packages/mcp-server/package.json').version")
-          NEW=$(npx semver -i "$BUMP" "$CURRENT")
-          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          # Each product maps to a `.craft.yml` workspace. The `cli` release
+          # also publishes @sentry/mcp-server at the same version.
+          case "$PRODUCT" in
+            cli)
+              workspace=packages/cli
+              ;;
+            logger)
+              workspace=packages/logger
+              ;;
+            *)
+              echo "::error::Unsupported product: $PRODUCT"
+              exit 1
+              ;;
+          esac
+
+          echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release
-        uses: getsentry/action-prepare-release@v1
+        uses: getsentry/craft@v3
         env:
           GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         with:
-          version: ${{ steps.version.outputs.version }}
+          workspace: ${{ steps.release.outputs.workspace }}
+          # An exact version wins over the bump. Craft bumps from the
+          # workspace's latest release tag, or from its package.json version
+          # before the first tag.
+          version: ${{ inputs.version || inputs.bump }}
           force: ${{ inputs.force && 'true' || '' }}
+          # GITHUB_TOKEN above is the release bot token for git/GitHub ops.
+          # AI changelog summaries use the workflow token for Copilot requests.
+          llm_api_key: ${{ github.token }}

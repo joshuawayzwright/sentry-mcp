@@ -1,5 +1,3 @@
-import { setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
 import type { SentryApiService, Trace, TraceSpan } from "../../api-client";
 import { UserInputError } from "../../errors";
 import { hasAgentProvider } from "../../internal/agents/provider-factory";
@@ -17,6 +15,7 @@ import {
   ParamSpanId,
   ParamTraceId,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { formatSemanticSpanDisplay } from "../support/traces/semantic-display.js";
 
@@ -61,6 +60,7 @@ interface SpanExpansionCandidate {
 
 export default defineTool({
   name: "get_trace_details",
+  title: "Get Trace Details",
   skills: ["inspect"], // Only available in inspect skill
   requiredScopes: ["event:read"],
   requiredCapabilities: ["traces"],
@@ -75,8 +75,8 @@ export default defineTool({
     "- Want an overview first, then a guided pivot into additional spans or events",
     "",
     "DO NOT USE for:",
-    "- General searching for traces (use search_events with trace queries)",
-    "- Complete span enumeration or branch-by-branch reconstruction (use search_events scoped to the trace)",
+    "- General searching for traces (use search_traces)",
+    "- Complete span enumeration or branch-by-branch reconstruction (use search_traces scoped to the trace)",
     "",
     "TRIGGER PATTERNS:",
     "- 'Show me trace abc123' → use get_trace_details",
@@ -99,7 +99,7 @@ export default defineTool({
     "- Trace IDs are 32-character hexadecimal strings",
     "- This returns a condensed trace overview, not a full span dump",
     "- Provide `spanId` to focus on a single span within the trace",
-    "- If the response says it shows a subset of spans, use search_events to inspect the rest of the trace",
+    "- If the response says it shows a subset of spans, use search_traces to inspect the rest of the trace",
     "</hints>",
   ].join("\n"),
   inputSchema: {
@@ -131,15 +131,12 @@ export default defineTool({
       regionUrl: regionUrl ?? undefined,
     });
 
-    setOrganizationContext(params.organizationSlug);
-    setTag("trace.id", params.traceId);
-    if (params.spanId) {
-      setTag("trace.span_id", params.spanId);
-    }
-
-    if (context.constraints.projectSlug) {
-      setTag("project.slug", context.constraints.projectSlug);
-    }
+    setTargetTagsAndAttributes({
+      organizationSlug: params.organizationSlug,
+      projectSlug: context.constraints.projectSlug,
+      traceId: params.traceId,
+      spanId: params.spanId,
+    });
 
     // Get trace metadata for overview
     const traceMeta = await apiService.getTraceMeta({
@@ -603,18 +600,20 @@ function calculateOperationStats(trace: Trace): Record<
   }
 > {
   const allSpans = getAllSpansFlattened(trace);
-  const operationSpans: Record<string, TraceSpan[]> = {};
+  const operationSpans = new Map<string, TraceSpan[]>();
 
   // Group leaf spans by operation type (only spans with no children)
   for (const span of allSpans) {
     // Only consider leaf nodes - spans that have no children
-    if (!span.children || span.children.length === 0) {
+    if (span.children.length === 0) {
       // Use span.op if available, otherwise extract from span.name, fallback to "unknown"
       const op = span.op || (span.name ? span.name.split(" ")[0] : "unknown");
-      if (!operationSpans[op]) {
-        operationSpans[op] = [];
+      const bucket = operationSpans.get(op);
+      if (bucket) {
+        bucket.push(span);
+      } else {
+        operationSpans.set(op, [span]);
       }
-      operationSpans[op].push(span);
     }
   }
 
@@ -624,7 +623,7 @@ function calculateOperationStats(trace: Trace): Record<
   > = {};
 
   // Calculate stats for each operation
-  for (const [op, opSpans] of Object.entries(operationSpans)) {
+  for (const [op, opSpans] of operationSpans) {
     const durations = opSpans
       .map((span) => span.duration || 0)
       .filter((duration) => duration > 0)
@@ -899,7 +898,7 @@ function formatFocusedSpanOutput({
   sections.push("");
   sections.push("## Summary");
   sections.push("");
-  sections.push(`**Project**: ${focusedSpan.project_slug ?? "unknown"}`);
+  sections.push(`**Project**: ${focusedSpan.project_slug}`);
   sections.push(`**Operation**: ${focusedSpan.op ?? "unknown"}`);
   sections.push(`**Description**: ${formatTraceSpanDescription(focusedSpan)}`);
   sections.push(`**Duration**: ${formatDuration(focusedSpan.duration)}`);
@@ -1076,20 +1075,18 @@ function formatSpanAttributeSections(
       span.additional_attributes ?? {},
     ),
   );
-  sections.push(...formatJsonSection("### Errors", span.errors ?? []));
-  sections.push(
-    ...formatJsonSection("### Occurrences", span.occurrences ?? []),
-  );
+  sections.push(...formatJsonSection("### Errors", span.errors));
+  sections.push(...formatJsonSection("### Occurrences", span.occurrences));
 
   return sections;
 }
 
-function formatJsonSection(title: string, value: unknown): string[] {
+function formatJsonSection(title: string, value: object): string[] {
   return [
     title,
     "",
     "```json",
-    JSON.stringify(sortJsonValue(value), null, 2) ?? "null",
+    JSON.stringify(sortJsonValue(value), null, 2),
     "```",
     "",
   ];
@@ -1248,15 +1245,17 @@ function buildTraceNextSteps({
 }): string[] {
   const formatSearchStep = ({
     label,
+    toolName,
     arguments: args,
     fallbackInstruction,
   }: {
     label: string;
+    toolName: "search_traces" | "search_errors" | "search_logs";
     arguments: Record<string, string>;
     fallbackInstruction: string;
   }) =>
     `- **${label}**: ${formatToolCallInstruction({
-      toolName: "search_events",
+      toolName,
       arguments: {
         organizationSlug,
         ...args,
@@ -1275,6 +1274,7 @@ function buildTraceNextSteps({
     return [
       formatSearchStep({
         label: "Search spans",
+        toolName: "search_traces",
         arguments: {
           query: spanQuery,
         },
@@ -1282,6 +1282,7 @@ function buildTraceNextSteps({
       }),
       formatSearchStep({
         label: "Search errors",
+        toolName: "search_errors",
         arguments: {
           query: `show error events from trace ${traceId}`,
         },
@@ -1289,6 +1290,7 @@ function buildTraceNextSteps({
       }),
       formatSearchStep({
         label: "Search logs",
+        toolName: "search_logs",
         arguments: {
           query: `show logs from trace ${traceId}`,
         },
@@ -1300,24 +1302,24 @@ function buildTraceNextSteps({
   return [
     formatSearchStep({
       label: "Search spans",
+      toolName: "search_traces",
       arguments: {
-        dataset: "spans",
         query: `trace:${traceId}`,
       },
       fallbackInstruction: "Span search is not available in this session",
     }),
     formatSearchStep({
       label: "Search errors",
+      toolName: "search_errors",
       arguments: {
-        dataset: "errors",
         query: `trace:${traceId}`,
       },
       fallbackInstruction: "Error search is not available in this session",
     }),
     formatSearchStep({
       label: "Search logs",
+      toolName: "search_logs",
       arguments: {
-        dataset: "logs",
         query: `trace:${traceId}`,
       },
       fallbackInstruction: "Log search is not available in this session",

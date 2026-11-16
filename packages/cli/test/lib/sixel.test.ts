@@ -1,0 +1,572 @@
+/**
+ * Sixel Banner Tests
+ *
+ * Covers the pure, terminal-independent pieces of sixel support: DA1/cell-size
+ * reply parsing, fit calculation, the safe non-TTY default, and the shape of the
+ * baked banner module. The terminal round-trip in `probe()` is intentionally not
+ * exercised (it requires a real tty); everything it feeds is unit-tested here.
+ */
+
+import {
+  closeSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { assert as fcAssert, integer, property, uniqueArray } from "fast-check";
+import { afterEach, describe, expect, test } from "vitest";
+import { BANNER_IMAGE } from "../../src/generated/banner-image.js";
+import {
+  __resetSixelCache,
+  applyTmuxCaps,
+  detectSixelCaps,
+  graphicsBanner,
+  graphicsCellSize,
+  optedOut,
+  parseSixelCaps,
+  parseTmuxInfo,
+  kittyQueryCleanup,
+  probeQueries,
+  readReply,
+  selectGraphicsFormat,
+  selectGraphicsFormatFromAvailability,
+  sixelFits,
+  terminalPixelWidth,
+  tmuxKittyPlacement,
+} from "../../src/lib/sixel.js";
+import { decodeImage, encodeImageToSixel } from "../../src/lib/sixel-image.js";
+import { DEFAULT_NUM_RUNS } from "../model-based/helpers.js";
+
+const ESC = "\x1b";
+
+describe("parseSixelCaps", () => {
+  test("detects sixel from DA1 attribute 4", () => {
+    const caps = parseSixelCaps(`${ESC}[?62;4;6c`);
+    expect(caps.supported).toBe(true);
+  });
+
+  test("treats missing attribute 4 as unsupported", () => {
+    expect(parseSixelCaps(`${ESC}[?62;1;6c`).supported).toBe(false);
+  });
+
+  test("does not match 4 as a substring of another attribute", () => {
+    // 14, 40, 64 all contain '4' but are not the sixel attribute.
+    expect(parseSixelCaps(`${ESC}[?14;40;64c`).supported).toBe(false);
+  });
+
+  test("parses cell size from CSI 16 t report", () => {
+    const caps = parseSixelCaps(`${ESC}[?62;4c${ESC}[6;20;10t`);
+    expect(caps).toMatchObject({
+      supported: true,
+      cellHeight: 20,
+      cellWidth: 10,
+    });
+  });
+
+  test("supported but no cell size when 16t is absent", () => {
+    const caps = parseSixelCaps(`${ESC}[?62;4c`);
+    expect(caps.supported).toBe(true);
+    expect(caps.cellWidth).toBeUndefined();
+  });
+
+  test("garbage / empty replies are unsupported", () => {
+    expect(parseSixelCaps("").supported).toBe(false);
+    expect(parseSixelCaps("not a terminal reply").supported).toBe(false);
+  });
+
+  test("property: supported iff the attribute list contains exactly '4'", () => {
+    fcAssert(
+      property(
+        uniqueArray(integer({ min: 0, max: 99 }), { maxLength: 8 }),
+        (attrs) => {
+          const reply = `${ESC}[?${attrs.join(";")}c`;
+          expect(parseSixelCaps(reply).supported).toBe(attrs.includes(4));
+        },
+      ),
+      { numRuns: DEFAULT_NUM_RUNS },
+    );
+  });
+
+  test("detects kitty support from an OK graphics reply", () => {
+    const caps = parseSixelCaps(`${ESC}_Gi=31;OK${ESC}\\${ESC}[?62c`);
+    expect(caps.kitty).toBe(true);
+  });
+
+  test("kitty support does not imply sixel support", () => {
+    const caps = parseSixelCaps(`${ESC}_Gi=31;OK${ESC}\\${ESC}[?62c`);
+    expect(caps.supported).toBe(false);
+  });
+
+  test("reports both when the terminal advertises sixel and kitty", () => {
+    const caps = parseSixelCaps(`${ESC}_Gi=31;OK${ESC}\\${ESC}[?62;4c`);
+    expect(caps).toMatchObject({ supported: true, kitty: true });
+  });
+
+  test("a kitty error reply is not treated as support", () => {
+    const caps = parseSixelCaps(`${ESC}_Gi=31;ENOENT:bad${ESC}\\${ESC}[?62c`);
+    expect(caps.kitty).toBeUndefined();
+  });
+});
+
+describe("sixelFits", () => {
+  const caps = { supported: true, cellWidth: 10, cellHeight: 20 };
+
+  test("fits when banner width <= columns * cellWidth", () => {
+    expect(sixelFits(caps, 80, 640)).toBe(true); // 800px available >= 640
+    expect(sixelFits(caps, 64, 640)).toBe(true); // exactly 640px
+  });
+
+  test("does not fit when the image is wider than the terminal", () => {
+    expect(sixelFits(caps, 60, 640)).toBe(false); // 600px < 640
+  });
+
+  test("declines without a known cell width", () => {
+    expect(sixelFits({ supported: true }, 200, 640)).toBe(false);
+    expect(sixelFits({ supported: true, cellWidth: 0 }, 200, 640)).toBe(false);
+  });
+
+  test("declines when unsupported", () => {
+    expect(sixelFits({ supported: false, cellWidth: 10 }, 200, 640)).toBe(
+      false,
+    );
+  });
+});
+
+describe("terminalPixelWidth", () => {
+  afterEach(() => {
+    __resetSixelCache();
+  });
+
+  test("returns undefined when the terminal has no sixel caps (non-TTY test env)", () => {
+    // Under the test runner stdin/stdout are not TTYs, so the probe reports
+    // unsupported and there's no cell width to derive a pixel budget from.
+    __resetSixelCache();
+    expect(terminalPixelWidth(80)).toBeUndefined();
+  });
+});
+
+describe("selectGraphicsFormat", () => {
+  afterEach(() => {
+    __resetSixelCache();
+  });
+
+  test("returns undefined in a non-interactive (test) environment", () => {
+    // Under vitest stdin/stdout are not TTYs, so neither kitty nor sixel is
+    // available and the caller falls back to ASCII.
+    __resetSixelCache();
+    expect(selectGraphicsFormat()).toBeUndefined();
+  });
+
+  test("falls back to the automatic renderer when the requested one is unavailable", () => {
+    expect(
+      selectGraphicsFormatFromAvailability("sixel", {
+        kitty: true,
+        sixel: false,
+      }),
+    ).toBe("kitty");
+  });
+});
+
+describe("graphicsCellSize", () => {
+  afterEach(() => {
+    __resetSixelCache();
+  });
+
+  test("returns undefined when no graphics format is available", () => {
+    // No TTY in the test env means no graphics format, so no cell size either.
+    __resetSixelCache();
+    expect(graphicsCellSize()).toBeUndefined();
+  });
+});
+
+describe("graphicsBanner", () => {
+  test("returns undefined in a non-interactive (test) environment", () => {
+    // Under vitest stdin/stdout are not TTYs, so the probe opts out and no
+    // image is emitted — the caller falls back to block art.
+    expect(graphicsBanner(200)).toBeUndefined();
+    expect(tmuxKittyPlacement(200)).toBeUndefined();
+  });
+
+  test("suppresses the image when opted out even with a TTY", () => {
+    const saved = {
+      stdout: process.stdout.isTTY,
+      stdin: process.stdin.isTTY,
+      noSixel: process.env.SENTRY_NO_SIXEL,
+    };
+    try {
+      // TTY on both ends, but SENTRY_NO_SIXEL forces opt-out: the emit-path
+      // guard must return undefined without emitting (and without probing).
+      process.stdout.isTTY = true;
+      process.stdin.isTTY = true;
+      process.env.SENTRY_NO_SIXEL = "1";
+      __resetSixelCache();
+      expect(graphicsBanner(200)).toBeUndefined();
+    } finally {
+      process.stdout.isTTY = saved.stdout;
+      process.stdin.isTTY = saved.stdin;
+      if (saved.noSixel === undefined) {
+        delete process.env.SENTRY_NO_SIXEL;
+      } else {
+        process.env.SENTRY_NO_SIXEL = saved.noSixel;
+      }
+      __resetSixelCache();
+    }
+  });
+});
+
+describe("BANNER_IMAGE (generated)", () => {
+  test("is a PNG with positive dimensions", () => {
+    expect(BANNER_IMAGE.width).toBeGreaterThan(0);
+    expect(BANNER_IMAGE.height).toBeGreaterThan(0);
+    const png = Buffer.from(BANNER_IMAGE.png, "base64");
+    // PNG signature, then the IHDR width/height (big-endian at bytes 16..23).
+    expect(png.subarray(1, 4).toString("latin1")).toBe("PNG");
+    expect(png.readUInt32BE(16)).toBe(BANNER_IMAGE.width);
+    expect(png.readUInt32BE(20)).toBe(BANNER_IMAGE.height);
+  });
+
+  test("encodes to a transparent native-size sixel with its gradient colors", () => {
+    const image = decodeImage(Buffer.from(BANNER_IMAGE.png, "base64"), "png");
+    expect(image).toBeDefined();
+    const sixel = image && encodeImageToSixel(image, image.width, true);
+    // Transparent background: P2 = 1, then raster attributes at native size.
+    expect(
+      sixel?.startsWith(
+        `${ESC}P0;1;0q"1;1;${BANNER_IMAGE.width};${BANNER_IMAGE.height}`,
+      ),
+    ).toBe(true);
+    expect(sixel?.endsWith(`${ESC}\\`)).toBe(true);
+    // The banner is painted from 24 gradient bands, so the palette keeps
+    // those exact colors instead of filling all 128 slots.
+    const paletteEntries = sixel?.match(/#\d+;2;/g) ?? [];
+    expect(paletteEntries.length).toBeGreaterThan(0);
+    expect(paletteEntries.length).toBeLessThanOrEqual(24);
+  });
+});
+
+describe("parseTmuxInfo", () => {
+  test("reads allow-passthrough and the attached terminal's features", () => {
+    expect(parseTmuxInfo("on bpaste,clipboard,sixel,title\n")).toEqual({
+      passthrough: true,
+      outerSixel: true,
+    });
+    expect(parseTmuxInfo("all bpaste,title")).toEqual({
+      passthrough: true,
+      outerSixel: false,
+    });
+    expect(parseTmuxInfo("off sixel")).toEqual({
+      passthrough: false,
+      outerSixel: true,
+    });
+  });
+
+  test("treats tmux without allow-passthrough (pre-3.3) as disabled", () => {
+    expect(parseTmuxInfo(" bpaste,title")).toEqual({
+      passthrough: false,
+      outerSixel: false,
+    });
+  });
+});
+
+describe("probeQueries", () => {
+  test("outside tmux, sends the kitty query between cursor reports with DA1 last", () => {
+    const { query, sentinels } = probeQueries(undefined);
+    // Autowrap is off around the kitty query so printed text can't wrap.
+    expect(query.startsWith(`${ESC}[16t${ESC}[6n${ESC}[?7l${ESC}_G`)).toBe(
+      true,
+    );
+    expect(query.endsWith(`${ESC}[?7h${ESC}[6n${ESC}[c`)).toBe(true);
+    expect(sentinels).toBe(1);
+  });
+
+  test("inside tmux without passthrough, never sends the kitty query", () => {
+    // tmux would turn the bare APC into the pane title.
+    const { query, sentinels } = probeQueries({
+      passthrough: false,
+      outerSixel: false,
+    });
+    expect(query).toBe(`${ESC}[16t${ESC}[c`);
+    expect(sentinels).toBe(1);
+  });
+
+  test("inside tmux with passthrough, wraps the kitty query and a second DA1", () => {
+    const { query, sentinels } = probeQueries({
+      passthrough: true,
+      outerSixel: false,
+    });
+    const passthrough = query.slice(`${ESC}[16t${ESC}[c`.length);
+    expect(passthrough.startsWith(`${ESC}Ptmux;${ESC}${ESC}_G`)).toBe(true);
+    expect(passthrough.endsWith(`${ESC}${ESC}[c${ESC}\\`)).toBe(true);
+    expect(sentinels).toBe(2);
+  });
+});
+
+describe("kittyQueryCleanup", () => {
+  const da = `${ESC}[?1;2c`;
+
+  test("does nothing when the cursor did not move", () => {
+    // The terminal ignored the query, or answered it without drawing.
+    expect(kittyQueryCleanup(`${ESC}[12;1R${ESC}[12;1R${da}`)).toBe("");
+    expect(
+      kittyQueryCleanup(
+        `${ESC}[12;1R${ESC}_Gi=4271;OK${ESC}\\${ESC}[12;1R${da}`,
+      ),
+    ).toBe("");
+  });
+
+  test("erases the printed query on the same line", () => {
+    // macOS Terminal.app prints the APC body, moving the cursor right.
+    expect(kittyQueryCleanup(`${ESC}[12;1R${ESC}[12;34R${da}`)).toBe(
+      `${ESC}[12;1H${ESC}[K`,
+    );
+  });
+
+  test("does nothing without both cursor reports", () => {
+    expect(kittyQueryCleanup(da)).toBe("");
+    expect(kittyQueryCleanup(`${ESC}[12;1R${da}`)).toBe("");
+  });
+});
+
+describe("applyTmuxCaps", () => {
+  const tmuxSixelDa = `${ESC}[6;20;10t${ESC}[?1;2;4c`;
+
+  test("ignores tmux's own sixel claim when the outer terminal lacks sixel", () => {
+    // e.g. Homebrew tmux (built with sixel) running inside Ghostty.
+    const caps = parseSixelCaps(tmuxSixelDa);
+    expect(caps.supported).toBe(true);
+    expect(
+      applyTmuxCaps(caps, { passthrough: false, outerSixel: false }),
+    ).toEqual({ supported: false });
+  });
+
+  test("keeps sixel when the outer terminal supports it", () => {
+    const caps = parseSixelCaps(tmuxSixelDa);
+    expect(
+      applyTmuxCaps(caps, { passthrough: false, outerSixel: true }),
+    ).toMatchObject({ supported: true, cellWidth: 10, cellHeight: 20 });
+  });
+
+  test("marks kitty found through passthrough as needing tmux placement", () => {
+    const reply = `${tmuxSixelDa}${ESC}_Gi=4271;OK${ESC}\\${ESC}[?62;22c`;
+    expect(
+      applyTmuxCaps(parseSixelCaps(reply), {
+        passthrough: true,
+        outerSixel: false,
+      }),
+    ).toEqual({
+      supported: false,
+      kitty: true,
+      tmux: true,
+      cellWidth: 10,
+      cellHeight: 20,
+    });
+  });
+});
+
+describe("optedOut", () => {
+  const saved = {
+    stdout: process.stdout.isTTY,
+    stdin: process.stdin.isTTY,
+    TERM: process.env.TERM,
+    SENTRY_NO_SIXEL: process.env.SENTRY_NO_SIXEL,
+    SENTRY_NO_GRAPHICS: process.env.SENTRY_NO_GRAPHICS,
+    NO_COLOR: process.env.NO_COLOR,
+    SENTRY_PLAIN_OUTPUT: process.env.SENTRY_PLAIN_OUTPUT,
+    FORCE_COLOR: process.env.FORCE_COLOR,
+  };
+
+  const setEnv = (key: string, value: string | undefined): void => {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  };
+
+  afterEach(() => {
+    process.stdout.isTTY = saved.stdout;
+    process.stdin.isTTY = saved.stdin;
+    setEnv("TERM", saved.TERM);
+    setEnv("SENTRY_NO_SIXEL", saved.SENTRY_NO_SIXEL);
+    setEnv("SENTRY_NO_GRAPHICS", saved.SENTRY_NO_GRAPHICS);
+    setEnv("NO_COLOR", saved.NO_COLOR);
+    setEnv("SENTRY_PLAIN_OUTPUT", saved.SENTRY_PLAIN_OUTPUT);
+    setEnv("FORCE_COLOR", saved.FORCE_COLOR);
+  });
+
+  /** Put the process in a state where sixel probing WOULD be allowed. */
+  function makeInteractive(): void {
+    process.stdout.isTTY = true;
+    process.stdin.isTTY = true;
+    setEnv("TERM", "xterm-256color");
+    setEnv("SENTRY_NO_SIXEL", undefined);
+    setEnv("NO_COLOR", undefined);
+    setEnv("SENTRY_PLAIN_OUTPUT", undefined);
+    setEnv("FORCE_COLOR", undefined);
+  }
+
+  test("does not opt out on an interactive color terminal (non-win32)", () => {
+    makeInteractive();
+    if (process.platform !== "win32") {
+      expect(optedOut()).toBe(false);
+    }
+  });
+
+  test("opts out when stdout or stdin is not a TTY", () => {
+    makeInteractive();
+    process.stdout.isTTY = false;
+    expect(optedOut()).toBe(true);
+    makeInteractive();
+    process.stdin.isTTY = false;
+    expect(optedOut()).toBe(true);
+  });
+
+  test("opts out when TERM is unset or dumb", () => {
+    makeInteractive();
+    setEnv("TERM", undefined);
+    expect(optedOut()).toBe(true);
+    makeInteractive();
+    setEnv("TERM", "dumb");
+    expect(optedOut()).toBe(true);
+  });
+
+  test("opts out under plain-output signals (NO_COLOR)", () => {
+    makeInteractive();
+    setEnv("NO_COLOR", "1");
+    expect(optedOut()).toBe(true);
+  });
+
+  test("SENTRY_NO_SIXEL honors truthiness (0/false do not opt out)", () => {
+    makeInteractive();
+    setEnv("SENTRY_NO_SIXEL", "1");
+    expect(optedOut()).toBe(true);
+    makeInteractive();
+    setEnv("SENTRY_NO_SIXEL", "0");
+    if (process.platform !== "win32") {
+      expect(optedOut()).toBe(false);
+    }
+    makeInteractive();
+    setEnv("SENTRY_NO_SIXEL", "false");
+    if (process.platform !== "win32") {
+      expect(optedOut()).toBe(false);
+    }
+  });
+
+  test("SENTRY_NO_GRAPHICS opts out", () => {
+    setEnv("SENTRY_NO_GRAPHICS", "1");
+    expect(optedOut()).toBe(true);
+  });
+});
+
+describe("readReply", () => {
+  function withReplyFile(bytes: string, fn: (fd: number) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "sixel-reply-"));
+    const file = join(dir, "reply");
+    writeFileSync(file, bytes, "latin1");
+    const fd = openSync(file, "r");
+    try {
+      fn(fd);
+    } finally {
+      closeSync(fd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("drains the full reply up to the Primary DA sentinel", () => {
+    // Cell-size report first, Primary DA (sentinel, ends in `c`) last.
+    withReplyFile(`${ESC}[6;20;10t${ESC}[?62;4;6c`, (fd) => {
+      const reply = readReply(fd);
+      expect(reply).toContain("c");
+      expect(parseSixelCaps(reply)).toMatchObject({
+        supported: true,
+        cellHeight: 20,
+        cellWidth: 10,
+      });
+    });
+  });
+
+  test("waits for every requested DA sentinel (tmux passthrough)", () => {
+    const reply = `${ESC}[?1;2;4c${ESC}_Gi=4271;OK${ESC}\\${ESC}[?62;22c`;
+    withReplyFile(reply, (fd) => {
+      expect(readReply(fd, 2)).toBe(reply);
+    });
+  });
+
+  test("keeps waiting through a quiet read for the passthrough sentinel", () => {
+    // tmux answers at once; the outer terminal's replies come after a gap
+    // longer than one read timeout.
+    const chunks = [
+      `${ESC}[?1;2;4c`,
+      "",
+      `${ESC}_Gi=4271;OK${ESC}\\${ESC}[?62;22c`,
+    ];
+    const reply = readReply(-1, 2, (buf) => {
+      const chunk = chunks.shift() ?? "";
+      return buf.write(chunk, "latin1");
+    });
+    expect(parseSixelCaps(reply)).toMatchObject({
+      supported: true,
+      kitty: true,
+    });
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("gives up on the passthrough sentinel after repeated quiet reads", () => {
+    let reads = 0;
+    const reply = readReply(-1, 2, (buf) => {
+      reads += 1;
+      return reads === 1 ? buf.write(`${ESC}[?1;2;4c`, "latin1") : 0;
+    });
+    expect(reply).toBe(`${ESC}[?1;2;4c`);
+    expect(reads).toBe(5);
+  });
+
+  test("stops at the first quiet read when no sentinel is pending", () => {
+    let reads = 0;
+    readReply(-1, 1, (buf) => {
+      reads += 1;
+      return reads === 1 ? buf.write(`${ESC}[6;20;10t`, "latin1") : 0;
+    });
+    expect(reads).toBe(2);
+  });
+
+  test("returns an empty string at EOF with no reply", () => {
+    withReplyFile("", (fd) => {
+      expect(readReply(fd)).toBe("");
+    });
+  });
+
+  test("does not stop on a stray 'c' before the Primary DA reply", () => {
+    // A stray `c` (e.g. a keypress) followed by the cell-size report but NO DA
+    // reply: readReply must keep draining rather than stop at the stray `c`.
+    withReplyFile(`c${ESC}[6;20;10t`, (fd) => {
+      expect(readReply(fd)).toBe(`c${ESC}[6;20;10t`);
+    });
+  });
+
+  test("captures the full reply even when preceded by a stray 'c'", () => {
+    withReplyFile(`c${ESC}[6;20;10t${ESC}[?62;4;6c`, (fd) => {
+      expect(parseSixelCaps(readReply(fd))).toMatchObject({
+        supported: true,
+        cellWidth: 10,
+      });
+    });
+  });
+});
+
+describe("detectSixelCaps", () => {
+  afterEach(() => {
+    __resetSixelCache();
+  });
+
+  test("caches the probe result (unsupported in a non-TTY test env)", () => {
+    __resetSixelCache();
+    const first = detectSixelCaps();
+    const second = detectSixelCaps();
+    expect(first).toBe(second); // same cached reference — probed at most once
+    expect(first.supported).toBe(false);
+  });
+});

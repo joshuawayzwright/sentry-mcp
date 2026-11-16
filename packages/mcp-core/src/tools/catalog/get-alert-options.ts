@@ -12,7 +12,7 @@ import {
   ParamProjectSlugOrAll,
   ParamRegionUrl,
 } from "../../schema";
-import { setOrganizationContext } from "../../telem/organization";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { assertProjectRefWithinConstraint } from "./support/project-constraints";
 
@@ -50,6 +50,7 @@ export const getAlertOptionsOutputSchema = z.object({
 
 export default defineTool({
   name: "get_alert_options",
+  title: "Get Alert Options",
   skills: ["inspect"],
   requiredScopes: ["org:read", "project:read"],
   description: [
@@ -145,7 +146,7 @@ export default defineTool({
     const api = apiServiceFromContext(context, {
       regionUrl: params.regionUrl ?? undefined,
     });
-    setOrganizationContext(organizationSlug);
+    setTargetTagsAndAttributes({ organizationSlug });
     const pageParams = {
       organizationSlug,
       cursor: params.cursor ?? undefined,

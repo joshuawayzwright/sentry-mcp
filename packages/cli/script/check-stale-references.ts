@@ -1,0 +1,160 @@
+/**
+ * Check for Stale Toolchain References
+ *
+ * Scans dev-facing documentation and scripts for references to package
+ * managers or runtimes that are no longer used by this project. The check
+ * is generic: it reads `packageManager` from package.json to determine
+ * the current PM, then flags any dev-facing file that references a
+ * a different PM's commands (e.g., `bun run`, `yarn remove`).
+ *
+ * If the project migrates from pnpm to another PM, simply updating the
+ * `packageManager` field in package.json will automatically make this
+ * check flag every `pnpm run` / `pnpm add` reference in dev docs.
+ *
+ * Usage:
+ *   pnpm ts script/check-stale-references.ts
+ *
+ * Exit codes:
+ *   0 - No stale references found
+ *   1 - Stale references detected
+ */
+
+import { readdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { blankCodeBlocks } from "./markdown.js";
+import { DOCS_CONTENT } from "./paths.js";
+import { logger } from "../src/lib/logger.js";
+
+const pkg = JSON.parse(await readFile("package.json", "utf-8"));
+const currentPM: string = (pkg.packageManager ?? "").split("@")[0];
+
+if (!currentPM) {
+  logger.error("Cannot determine package manager from package.json");
+  process.exit(1);
+}
+
+/** All known JS package managers whose dev commands should not appear when another PM is active. */
+const ALL_PACKAGE_MANAGERS = ["bun", "yarn", "pnpm", "npm"];
+
+const stalePMs = ALL_PACKAGE_MANAGERS.filter((pm) => pm !== currentPM);
+
+if (stalePMs.length === 0) {
+  logger.success("No stale package manager patterns to check");
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Patterns (derived dynamically from the non-current package managers)
+// ---------------------------------------------------------------------------
+
+const escaped = stalePMs.join("|");
+
+type StalePattern = {
+  pattern: RegExp;
+  reason: string;
+};
+
+const PATTERNS: StalePattern[] = [
+  {
+    // "bun run", "yarn remove", "bun add -d", etc. (dev commands)
+    pattern: new RegExp(`\\b(?:${escaped})\\s+(?:run|remove|add\\s+-[dD])\\b`),
+    reason: `Use '${currentPM}' commands instead`,
+  },
+  {
+    // "requires Bun", "Yarn installed", "Bun runtime" (prerequisite prose)
+    pattern: new RegExp(
+      `\\b(?:requires\\s+(?:${escaped})|(?:${escaped})\\s+(?:installed|runtime))\\b`,
+      "i",
+    ),
+    reason: `Project uses ${currentPM}, not these runtimes`,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Files to scan (curated — dev-facing docs and scripts only)
+// ---------------------------------------------------------------------------
+
+/** Dev-facing doc files that should not reference stale PMs. */
+const DOC_FILES = [
+  "DEVELOPMENT.md",
+  "plugins/README.md",
+  `${DOCS_CONTENT}/contributing.md`,
+  `${DOCS_CONTENT}/library-usage.md`,
+];
+
+/** This script's own filename — excluded from scanning to avoid self-flagging. */
+const SELF = "script/check-stale-references.ts";
+
+/** Script files whose error messages / JSDoc should not reference stale PMs. */
+function getScriptFiles(): string[] {
+  try {
+    return readdirSync("script")
+      .filter((f) => f.endsWith(".ts"))
+      .map((f) => `script/${f}`)
+      .filter((f) => f !== SELF);
+  } catch {
+    return [];
+  }
+}
+
+const FILES_TO_SCAN = [...DOC_FILES, ...getScriptFiles()];
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+type Finding = {
+  file: string;
+  line: number;
+  text: string;
+  reason: string;
+};
+
+const findings: Finding[] = [];
+
+for (const filePath of FILES_TO_SCAN) {
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf-8");
+  } catch {
+    // File doesn't exist — skip silently (e.g., optional doc files)
+    continue;
+  }
+
+  // For markdown files, blank code blocks to avoid matching user install
+  // examples. Blanking keeps line numbers aligned with the original file.
+  const isMarkdown = filePath.endsWith(".md") || filePath.endsWith(".mdx");
+  const scannable = isMarkdown ? blankCodeBlocks(content) : content;
+
+  const lines = scannable.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (const { pattern, reason } of PATTERNS) {
+      if (pattern.test(line)) {
+        findings.push({
+          file: filePath,
+          line: i + 1,
+          text: line.trim(),
+          reason,
+        });
+      }
+    }
+  }
+}
+
+if (findings.length === 0) {
+  logger.success(
+    `No stale package manager references found (current: ${currentPM}, checked: ${FILES_TO_SCAN.length} files)`,
+  );
+  process.exit(0);
+}
+
+logger.error(
+  [
+    `Found ${findings.length} stale package manager reference(s) (current PM: ${currentPM}):\n`,
+    ...findings.map(
+      (f) => `  ${f.file}:${f.line}: ${f.text}\n    → ${f.reason}\n`,
+    ),
+  ].join("\n"),
+);
+process.exit(1);

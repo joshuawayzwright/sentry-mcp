@@ -1,14 +1,16 @@
-import { setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
 import { ApiNotFoundError } from "../../api-client";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
-import { fetchAndFormatBreadcrumbs } from "../../internal/tool-helpers/breadcrumbs";
+import {
+  fetchIssueBreadcrumbs,
+  issueBreadcrumbsOutputSchema,
+} from "../../internal/tool-helpers/breadcrumbs";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { enhanceNotFoundError } from "../../internal/tool-helpers/enhance-error";
 import {
   ensureIssueWithinProjectConstraint,
   parseIssueParams,
 } from "../../internal/tool-helpers/issue";
+import { structuredResult } from "../../internal/tool-helpers/results";
 import {
   ParamEventIdOrLatest,
   ParamIssueShortId,
@@ -16,10 +18,12 @@ import {
   ParamOrganizationSlug,
   ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 
 export default defineTool({
   name: "get_issue_breadcrumbs",
+  title: "Get Issue Breadcrumbs",
   skills: ["inspect", "triage"],
   requiredScopes: ["event:read"],
   description: [
@@ -50,6 +54,7 @@ export default defineTool({
     destructiveHint: false,
     openWorldHint: true,
   },
+  outputSchema: issueBreadcrumbsOutputSchema,
   async handler(params, context: ServerContext) {
     const parsed = parseIssueParams({
       issueUrl: params.issueUrl,
@@ -61,8 +66,10 @@ export default defineTool({
       regionUrl: params.regionUrl ?? context.constraints.regionUrl ?? undefined,
     });
 
-    setOrganizationContext(parsed.organizationSlug);
-    setTag("issue.id", parsed.issueId);
+    setTargetTagsAndAttributes({
+      organizationSlug: parsed.organizationSlug,
+      issueId: parsed.issueId,
+    });
 
     try {
       await ensureIssueWithinProjectConstraint({
@@ -71,11 +78,13 @@ export default defineTool({
         issueId: parsed.issueId,
         projectSlug: context.constraints.projectSlug,
       });
-      return await fetchAndFormatBreadcrumbs(
-        apiService,
-        parsed.organizationSlug,
-        parsed.issueId,
-        params.eventId,
+      return structuredResult(
+        await fetchIssueBreadcrumbs(
+          apiService,
+          parsed.organizationSlug,
+          parsed.issueId,
+          params.eventId,
+        ),
       );
     } catch (error) {
       if (error instanceof ApiNotFoundError) {

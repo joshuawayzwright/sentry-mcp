@@ -1,0 +1,153 @@
+{
+  "name": "sentry",
+  "version": "0.50.0-dev.0",
+  "description": "Sentry CLI - A command-line interface for using Sentry built by robots and humans for robots and humans",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getsentry/toolkit.git"
+  },
+  "main": "./dist/index.cjs",
+  "type": "module",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "bin": {
+    "sentry": "./dist/bin.cjs"
+  },
+  "files": [
+    "dist/*.cjs",
+    "dist/*.mjs",
+    "dist/index.d.cts",
+    "dist/index.d.mts",
+    "dist/node-sqlite3-wasm.wasm",
+    "dist/assets/spleen-8x16.bin",
+    "dist/vendor/symbolic_bg.wasm",
+    "LICENSE.md",
+    "THIRD_PARTY_LICENSES.md",
+    "README.md"
+  ],
+  "license": "FSL-1.1-Apache-2.0",
+  "engines": {
+    "node": ">=20.0"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.15"
+    }
+  },
+  "packageManager": "pnpm@10.11.0",
+  "sentryCi": {
+    "coverage": "coverage/lcov.info",
+    "npmRuntime": "bundle",
+    "policy": "ci:policy"
+  },
+  "scripts": {
+    "ts": "node --env-file-if-exists=.env.local --experimental-strip-types --import ./script/require-shim.mjs",
+    "cli": "node script/ensure-generated.mjs && node --env-file-if-exists=.env.local --experimental-strip-types --import ./script/require-shim.mjs --import ./script/strip-arg-separator.mjs src/bin.ts",
+    "dev": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && node --experimental-strip-types --import ./script/require-shim.mjs --import ./script/strip-arg-separator.mjs src/bin.ts",
+    "build": "pnpm --filter @sentry/mcp-core run build && node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && pnpm ts script/build.ts --single",
+    "build:all": "pnpm --filter @sentry/mcp-core run build && node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && pnpm ts script/build.ts",
+    "bundle": "pnpm --filter @sentry/mcp-core run build && node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && pnpm ts script/bundle.ts",
+    "typecheck": "pnpm --filter @sentry/mcp-core run build && node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && tsc --noEmit",
+    "lint": "pnpm -w exec oxlint --report-unused-disable-directives packages/cli && pnpm -w exec oxfmt --check packages/cli",
+    "lint:fix": "pnpm -w exec oxlint --fix packages/cli && pnpm -w exec oxfmt --write packages/cli",
+    "test": "pnpm run test:unit",
+    "test:unit": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && vitest run test/lib test/commands test/types test/script --coverage",
+    "test:changed": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk && vitest run --changed",
+    "test:e2e": "pnpm ts script/prepare-e2e-bundle.ts && vitest run test/e2e",
+    "generate": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs sdk",
+    "generate:sdk": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts sdk",
+    "generate:skill": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts skill",
+    "generate:banner": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts banner",
+    "generate:docs": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs",
+    "generate:grammar": "node ../../scripts/generate-parsers.mjs .",
+    "generate:output-schemas": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts output-schemas",
+    "generate:completions": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts completions",
+    "generate:top-level-routes": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts top-level-routes",
+    "generate:docs-sections": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs-sections",
+    "generate:schema": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts schema",
+    "generate:command-api": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts command-api",
+    "generate:command-docs": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts command-docs",
+    "eval:skill": "pnpm ts script/eval-skill.ts",
+    "bench": "pnpm ts script/bench.ts",
+    "bench:save": "pnpm ts script/bench.ts --save-baseline",
+    "bench:compare": "pnpm ts script/bench.ts --compare",
+    "bench:sweep": "pnpm ts script/bench-sweep.ts",
+    "check:fragments": "pnpm ts script/check-fragments.ts --strict",
+    "check:deps": "pnpm ts script/check-no-deps.ts",
+    "check:errors": "pnpm ts script/check-error-patterns.ts",
+    "check:patches": "pnpm ts script/check-patches.ts",
+    "check:docs-sections": "node --experimental-strip-types --import ./script/require-shim.mjs script/generate.ts docs-sections --check",
+    "check:env-coverage": "pnpm ts script/check-env-coverage.ts",
+    "check:stale-refs": "pnpm ts script/check-stale-references.ts",
+    "check:doc-examples": "pnpm ts script/check-doc-examples.ts",
+    "check:installer-docs": "pnpm ts script/check-installer-docs.ts",
+    "check:destructive": "pnpm ts script/check-destructive-commands.ts",
+    "ci:policy": "pnpm run check:patches && pnpm run check:deps && pnpm run check:errors && pnpm run check:fragments && pnpm run check:docs-sections && pnpm run check:env-coverage && pnpm run check:stale-refs && pnpm run check:doc-examples && pnpm run check:installer-docs && pnpm run check:destructive"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@clack/prompts": "0.11.0",
+    "@hono/node-server": "^2.1.6",
+    "@sentry/api": "catalog:",
+    "@sentry/core": "catalog:",
+    "@sentry/logger": "workspace:*",
+    "@sentry/mcp-core": "workspace:*",
+    "@sentry/node": "catalog:",
+    "@sentry/search-syntax": "catalog:",
+    "@sentry/sqlish": "^1.0.1",
+    "@sentry/symbolic": "14.0.0-alpha.5",
+    "@sentry/toolkit-core": "workspace:*",
+    "@stricli/auto-complete": "^1.2.8",
+    "@stricli/core": "1.2.8",
+    "@types/http-cache-semantics": "^4.2.0",
+    "@types/node": "^22.20.0",
+    "@types/picomatch": "^4.0.3",
+    "@types/pngjs": "^6.0.5",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/semver": "^7.7.1",
+    "@types/yauzl": "3.4.0",
+    "@vitest/coverage-v8": "catalog:",
+    "binpatch": "^0.4.2",
+    "chalk": "^5.6.2",
+    "cli-highlight": "^2.1.11",
+    "esbuild": "^0.28.1",
+    "fast-check": "^4.8.0",
+    "fflate": "^0.8.3",
+    "fossilize": "^0.10.1",
+    "hono": "catalog:",
+    "http-cache-semantics": "^4.2.0",
+    "ignore": "^7.0.5",
+    "jpeg-js": "^0.4.4",
+    "marked": "catalog:",
+    "node-sqlite3-wasm": "0.8.59",
+    "p-limit": "^7.3.0",
+    "peggy": "^5.1.0",
+    "picomatch": "^4.0.4",
+    "pixelmatch": "^7.2.0",
+    "pngjs": "^7.0.0",
+    "pretty-ms": "^9.3.0",
+    "qrcode-terminal": "^0.12.0",
+    "semver": "^7.8.5",
+    "shell-quote": "^1.10.0",
+    "string-width": "^8.2.1",
+    "tinyglobby": "^0.2.17",
+    "typescript": "catalog:",
+    "uuidv7": "^1.2.1",
+    "valibot": "^1.4.2",
+    "vitest": "catalog:",
+    "wrap-ansi": "^10.0.0",
+    "yauzl": "3.4.0"
+  }
+}

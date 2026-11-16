@@ -1,4 +1,3 @@
-import { setTag } from "@sentry/core";
 import { z } from "zod";
 import type { AlertRuleUpdate, IssueAlertRule } from "../../api-client/types";
 import { UserInputError } from "../../errors";
@@ -6,25 +5,25 @@ import { apiServiceFromContext } from "../../internal/tool-helpers/api";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
 import { isPlainObject } from "../../internal/type-guards";
-import { setOrganizationContext } from "../../telem/organization";
 import {
   ParamOrganizationSlug,
   ParamProjectSlug,
   ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import {
-  resolveAlertRuleConnections,
-  validateAlertRuleProjectScope,
-} from "../support/alert-rule-connections";
-import {
-  alertRuleSummarySchema,
   alertRuleConfigFields,
+  alertRuleSummarySchema,
   assertResolvedAlertDestinations,
   ParamAlertActionFilters,
   ParamAlertTriggers,
   toAlertRuleSummary,
 } from "../support/alert-rule-config";
+import {
+  resolveAlertRuleConnections,
+  validateAlertRuleProjectScope,
+} from "../support/alert-rule-connections";
 import {
   findExactIssueAlertRuleMatches,
   isNumericAlertRuleId,
@@ -74,6 +73,7 @@ function resolveChangedSlackDestinations(
 
 export default defineTool({
   name: "update_alert_rule",
+  title: "Update Alert Rule",
   skills: ["project-management"],
   requiredScopes: ["org:read", "project:read", "alerts:write"],
   description: [
@@ -173,8 +173,7 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
-    setOrganizationContext(organizationSlug);
-    if (projectSlug) setTag("project.slug", projectSlug);
+    setTargetTagsAndAttributes({ organizationSlug, projectSlug });
     let ruleId = params.ruleIdOrName;
     if (!isNumericAlertRuleId(ruleId)) {
       const matches = await findExactIssueAlertRuleMatches(apiService, {

@@ -1,6 +1,4 @@
-import { setTag } from "@sentry/core";
 import { z } from "zod";
-import { setOrganizationContext } from "../../telem/organization";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
 import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
@@ -9,6 +7,7 @@ import {
   ParamProjectSlug,
   ParamRegionUrl,
 } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import { assertProjectRefWithinConstraint } from "./support/project-constraints";
 
@@ -20,6 +19,7 @@ export const deleteUptimeMonitorOutputSchema = z.object({
 
 export default defineTool({
   name: "delete_uptime_monitor",
+  title: "Delete Uptime Monitor",
   skills: ["project-management"],
   requiredScopes: ["project:write"],
   description: [
@@ -55,9 +55,7 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
-    setOrganizationContext(organizationSlug);
-    setTag("project.slug", params.projectSlug);
-    setTag("uptime.monitor_id", params.uptimeMonitorId);
+    setTargetTagsAndAttributes(params);
 
     assertProjectRefWithinConstraint({
       resourceLabel: "Uptime monitor",

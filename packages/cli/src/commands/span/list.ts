@@ -1,0 +1,721 @@
+/**
+ * sentry span list
+ *
+ * List spans from a Sentry project, or within a specific trace.
+ *
+ * Dual-mode command (like `log list`):
+ * - **Project mode** (no trace ID): lists spans across the entire project
+ * - **Trace mode** (trace ID provided): lists spans within a specific trace
+ *
+ * Disambiguation uses {@link parseDualModeInput}: trace mode when the
+ * arguments name a trace ID.
+ */
+
+import type { SentryContext } from "../../context.js";
+import type { SpanSortValue } from "../../lib/api/traces.js";
+import { listSpans } from "../../lib/api-client.js";
+import { sentry } from "../../lib/app-identity.js";
+import {
+  type ParsedOrgProject,
+  parseOrgProjectInput,
+  validateLimit,
+} from "../../lib/arg-parsing.js";
+import {
+  choiceParser,
+  ORG_PROJECT_TARGET,
+  textParser,
+} from "../../lib/completion-target.js";
+import {
+  advancePaginationState,
+  buildPaginationContextKey,
+  hasPreviousPage,
+  resolveCursor,
+} from "../../lib/db/pagination.js";
+import { toSearchQueryError } from "../../lib/errors.js";
+import {
+  type FlatSpan,
+  formatSpanTable,
+  spanListItemToFlatSpan,
+  translateSpanQuery,
+} from "../../lib/formatters/index.js";
+import { filterFields } from "../../lib/formatters/json.js";
+import { renderMarkdown } from "../../lib/formatters/markdown.js";
+import { CommandOutput } from "../../lib/formatters/output.js";
+import {
+  appendQueryHint,
+  buildListCommand,
+  LIST_DEFAULT_LIMIT,
+  LIST_MAX_LIMIT,
+  LIST_PERIOD_FLAG,
+  PERIOD_ALIASES,
+  paginationHint,
+  TARGET_PATTERN_NOTE,
+} from "../../lib/list-command.js";
+import type { ListEnvelope } from "../../lib/org-list.js";
+import { withProgress } from "../../lib/polling.js";
+import {
+  type BoundArguments,
+  boundArguments,
+} from "../../lib/positional-parse.js";
+import {
+  resolveLogProjectId,
+  resolveProjectBoundTarget,
+} from "../../lib/resolve-target.js";
+import { sanitizeQuery } from "../../lib/search-query.js";
+import { applySentryUrlContext } from "../../lib/sentry-url-parser.js";
+import {
+  appendPeriodHint,
+  serializeTimeRange,
+  type TimeRange,
+  timeRangeToApiParams,
+} from "../../lib/time-range.js";
+import {
+  applyTraceTargetInput,
+  parseDualModeInput,
+  type ResolvedTraceOrgProject,
+  resolveTraceOrgProject,
+  type TraceTargetInput,
+  warnIfNormalized,
+} from "../../lib/trace-target.js";
+import { FlatSpanSchema } from "../../generated/output-schemas/span.js";
+
+type ListFlags = {
+  readonly limit: number;
+  readonly query?: string;
+  readonly sort: SpanSortValue;
+  readonly period: TimeRange;
+  readonly cursor?: string;
+  readonly json: boolean;
+  readonly fresh: boolean;
+  readonly fields?: string[];
+};
+
+/**
+ * All field names already covered by the default SPAN_FIELDS request —
+ * both the raw API names (e.g., `id`, `span.op`) and their output-side
+ * aliases (e.g., `span_id`, `op`) produced by `spanListItemToFlatSpan`.
+ * Any `--fields` value NOT in this set is treated as a custom attribute
+ * and forwarded to the API as an extra `field` parameter.
+ */
+const KNOWN_SPAN_FIELDS = new Set([
+  // API names (in SPAN_FIELDS)
+  "id",
+  "parent_span",
+  "span.op",
+  "description",
+  "span.duration",
+  "timestamp",
+  "project",
+  "transaction",
+  "trace",
+  // Output aliases (from spanListItemToFlatSpan)
+  "span_id",
+  "trace_id",
+  "parent_span_id",
+  "op",
+  "duration_ms",
+  "start_timestamp",
+  "project_slug",
+]);
+
+/** Field group aliases that expand to curated field sets */
+const FIELD_GROUP_ALIASES: Record<string, string[]> = {
+  gen_ai: [
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.request.model",
+    "gen_ai.system",
+  ],
+};
+
+/**
+ * Extract field names from --fields that need additional API requests.
+ *
+ * Expands group aliases (e.g., `gen_ai` → four OTEL attribute fields) and
+ * filters out names already covered by the default SPAN_FIELDS request.
+ *
+ * @param fields - Raw --fields values from the CLI
+ * @returns Deduplicated extra API field names, or undefined if none are needed
+ */
+function extractExtraApiFields(
+  fields: string[] | undefined,
+): string[] | undefined {
+  if (!fields?.length) {
+    return;
+  }
+
+  const expanded = new Set<string>();
+  for (const f of fields) {
+    const alias = FIELD_GROUP_ALIASES[f];
+    if (alias) {
+      for (const a of alias) {
+        expanded.add(a);
+      }
+    } else {
+      expanded.add(f);
+    }
+  }
+
+  // Remove anything already requested by SPAN_FIELDS or its output aliases
+  for (const known of KNOWN_SPAN_FIELDS) {
+    expanded.delete(known);
+  }
+
+  return expanded.size > 0 ? [...expanded] : undefined;
+}
+
+/** Accepted values for the --sort flag (matches trace list) */
+const VALID_SORT_VALUES: SpanSortValue[] = ["date", "duration"];
+
+/** Default sort order for span results */
+const DEFAULT_SORT: SpanSortValue = "date";
+
+/** Default time period for span queries */
+const DEFAULT_PERIOD = "7d";
+
+/** Pagination storage key for trace-scoped span listing */
+export const PAGINATION_KEY = "span-list";
+
+/** Pagination storage key for project-scoped span listing */
+export const PROJECT_PAGINATION_KEY = "span-search";
+
+/** Command name used in resolver error messages (project mode) */
+const COMMAND_NAME = "span list";
+
+/** Usage hint for trace-mode ContextError messages */
+const traceUsageHint = () => sentry`span list [<org>/<project>/]<trace-id>`;
+
+/**
+ * Parse --limit flag, delegating range validation to shared utility.
+ */
+function parseLimit(value: string): number {
+  return validateLimit(value, 1, LIST_MAX_LIMIT);
+}
+
+/**
+ * Parse and validate sort flag value.
+ *
+ * @throws Error if value is not "date" or "duration"
+ */
+export function parseSort(value: string): SpanSortValue {
+  if (!VALID_SORT_VALUES.includes(value as SpanSortValue)) {
+    throw new Error(
+      `Invalid sort value. Must be one of: ${VALID_SORT_VALUES.join(", ")}`,
+    );
+  }
+  return value as SpanSortValue;
+}
+
+/** What `span list` lists, as parsed: a project's spans or a trace's. */
+type SpanListInput =
+  | {
+      readonly mode: "project";
+      readonly target: ParsedOrgProject;
+      /** Server of a pasted Sentry URL, for `applySentryUrlContext` */
+      readonly baseUrl?: string;
+    }
+  | { readonly mode: "trace"; readonly trace: TraceTargetInput };
+
+/** What `span list` lists, resolved. */
+type SpanListTarget =
+  | { readonly mode: "project"; readonly org: string; readonly project: string }
+  | ({ readonly mode: "trace" } & ResolvedTraceOrgProject);
+
+/** The arguments of `span list`. */
+type SpanListArguments = BoundArguments<SpanListInput, SpanListTarget>;
+
+/**
+ * Disambiguate span list positional arguments with
+ * {@link parseDualModeInput}, without side effects. Both modes need a
+ * project, so `<x>/<trace-id>` names project `<x>`.
+ *
+ * @internal Exported for testing
+ */
+export function parseSpanListInput(args: readonly string[]): SpanListInput {
+  const input = parseDualModeInput(args, traceUsageHint(), {
+    needsProject: true,
+  });
+  if (input.mode === "trace") {
+    return input;
+  }
+  const { parsed, baseUrl } = parseOrgProjectInput(input.target);
+  return { mode: "project", target: parsed, baseUrl };
+}
+
+/** Resolve `span list` arguments to the project, or the trace and project. */
+async function resolveSpanListTarget(
+  input: SpanListInput,
+  context: SentryContext,
+): Promise<SpanListTarget> {
+  if (input.mode === "trace") {
+    const parsed = applyTraceTargetInput(input.trace);
+    warnIfNormalized(parsed, "span.list");
+    const resolved = await resolveTraceOrgProject(
+      parsed,
+      context.cwd,
+      "span list",
+      traceUsageHint(),
+    );
+    return { mode: "trace", ...resolved };
+  }
+  if (input.baseUrl) {
+    applySentryUrlContext(input.baseUrl);
+  }
+  const { org, project } = await resolveProjectBoundTarget(
+    input.target,
+    context.cwd,
+    COMMAND_NAME,
+  );
+  return { mode: "project", org, project };
+}
+
+// ---------------------------------------------------------------------------
+// Next-page hints
+// ---------------------------------------------------------------------------
+
+/** Append active non-default flags to a base next-page command. */
+function appendFlagHints(
+  base: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  const parts: string[] = [];
+  if (flags.sort !== DEFAULT_SORT) {
+    parts.push(`--sort ${flags.sort}`);
+  }
+  appendQueryHint(parts, flags.query);
+  appendPeriodHint(parts, flags.period, DEFAULT_PERIOD);
+  return parts.length > 0 ? `${base} ${parts.join(" ")}` : base;
+}
+
+/** Build the CLI hint for fetching the next page in trace mode. */
+function traceNextPageHint(
+  org: string,
+  project: string,
+  traceId: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  return appendFlagHints(
+    sentry`span list ${org}/${project}/${traceId} -c next`,
+    flags,
+  );
+}
+
+/** Build the CLI hint for fetching the previous page in trace mode. */
+function tracePrevPageHint(
+  org: string,
+  project: string,
+  traceId: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  return appendFlagHints(
+    sentry`span list ${org}/${project}/${traceId} -c prev`,
+    flags,
+  );
+}
+
+/** Build the CLI hint for fetching the next page in project mode. */
+function projectNextPageHint(
+  org: string,
+  project: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  return appendFlagHints(sentry`span list ${org}/${project} -c next`, flags);
+}
+
+/** Build the CLI hint for fetching the previous page in project mode. */
+function projectPrevPageHint(
+  org: string,
+  project: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  return appendFlagHints(sentry`span list ${org}/${project} -c prev`, flags);
+}
+
+// ---------------------------------------------------------------------------
+// Output config types and formatters
+// ---------------------------------------------------------------------------
+
+/** Structured data returned by the command for both JSON and human output */
+type SpanListData = {
+  /** Flattened span items for display */
+  flatSpans: FlatSpan[];
+  /** Whether more results are available beyond the limit */
+  hasMore: boolean;
+  /** Whether a previous page exists (for bidirectional hints) */
+  hasPrev?: boolean;
+  /** Opaque cursor for fetching the next page (null/undefined when no more) */
+  nextCursor?: string | null;
+  /** The trace ID being queried (only in trace mode) */
+  traceId?: string;
+  /** Org slug for project-mode header */
+  org?: string;
+  /** Project slug for project-mode header */
+  project?: string;
+  /** Extra attribute names from --fields for human table columns */
+  extraAttributes?: string[];
+};
+
+/**
+ * Format span list data for human-readable terminal output.
+ *
+ * Uses `renderMarkdown()` for the header and `formatSpanTable()` for the table,
+ * ensuring proper rendering in both TTY and plain output modes.
+ * When extra attributes are present (from --fields API expansion), they are
+ * appended as additional table columns.
+ */
+function formatSpanListHuman(data: SpanListData): string {
+  if (data.flatSpans.length === 0) {
+    return data.hasMore
+      ? "No spans on this page."
+      : "No spans matched the query.";
+  }
+  const parts: string[] = [];
+  if (data.traceId) {
+    parts.push(renderMarkdown(`Spans in trace \`${data.traceId}\`:\n`));
+  } else {
+    parts.push(`Spans in ${data.org}/${data.project}:\n\n`);
+  }
+  // If trace mode is active, the trace ID is already in the header
+  // so skip rendering the trace ID column
+  parts.push(
+    formatSpanTable(data.flatSpans, data.extraAttributes, {
+      showTraceId: !data.traceId,
+    }),
+  );
+  return parts.join("\n");
+}
+
+/**
+ * Transform span list data for JSON output.
+ *
+ * Produces a `{ data: [...], hasMore, nextCursor? }` envelope matching the
+ * standard paginated list format. Applies `--fields` filtering per element.
+ */
+function jsonTransformSpanList(
+  data: SpanListData,
+  fields?: string[],
+): ListEnvelope<FlatSpan> {
+  const items =
+    fields && fields.length > 0
+      ? data.flatSpans.map((item) => filterFields(item, fields))
+      : data.flatSpans;
+  const envelope: ListEnvelope<FlatSpan> = {
+    data: items,
+    hasMore: data.hasMore,
+    hasPrev: !!data.hasPrev,
+  };
+  if (
+    data.nextCursor !== null &&
+    data.nextCursor !== undefined &&
+    data.nextCursor !== ""
+  ) {
+    envelope.nextCursor = data.nextCursor;
+  }
+  return envelope;
+}
+
+// ---------------------------------------------------------------------------
+// Mode handlers — extracted from func() to keep it readable
+// ---------------------------------------------------------------------------
+
+/** Shared context passed to mode handlers from the Stricli command function. */
+type ModeContext = {
+  flags: ListFlags;
+  /** Parsed time range from the --period flag */
+  timeRange: TimeRange;
+  /** Extra API field names derived from --fields (undefined when none needed) */
+  extraApiFields?: string[];
+};
+
+/**
+ * Handle trace mode: list spans within a specific trace.
+ *
+ * Builds a query prefixed with `trace:{id}` and returns the result with a
+ * trace-specific header and hints.
+ */
+async function handleTraceMode(
+  { traceId, org, project }: ResolvedTraceOrgProject,
+  ctx: ModeContext,
+): Promise<{ output: SpanListData; hint?: string }> {
+  const { flags, extraApiFields, timeRange } = ctx;
+  const queryParts = [`trace:${traceId}`];
+  if (flags.query) {
+    queryParts.push(translateSpanQuery(flags.query));
+  }
+  const apiQuery = queryParts.join(" ");
+
+  const contextKey = buildPaginationContextKey(
+    "span",
+    `${org}/${project}/${traceId}`,
+    { sort: flags.sort, q: flags.query, period: serializeTimeRange(timeRange) },
+  );
+  const { cursor, direction } = resolveCursor(
+    flags.cursor,
+    PAGINATION_KEY,
+    contextKey,
+  );
+
+  const { data: spanItems, nextCursor } = await withProgress(
+    { message: `Fetching spans (up to ${flags.limit})...`, json: flags.json },
+    () =>
+      listSpans(org, project, {
+        query: apiQuery,
+        sort: flags.sort,
+        limit: flags.limit,
+        cursor,
+        ...timeRangeToApiParams(timeRange),
+        extraFields: extraApiFields,
+        allProjects: true,
+      }).catch((error: unknown): never => {
+        // An unparseable user --query is a user input mistake, not a CLI bug.
+        throw toSearchQueryError(error, flags.query);
+      }),
+  );
+
+  // Update pagination state (handles both advance and truncation)
+  advancePaginationState(PAGINATION_KEY, contextKey, direction, nextCursor);
+  const hasPrev = hasPreviousPage(PAGINATION_KEY, contextKey);
+
+  const flatSpans = spanItems.map((item) =>
+    spanListItemToFlatSpan(item, extraApiFields),
+  );
+  const hasMore = !!nextCursor;
+
+  const nav = paginationHint({
+    hasPrev,
+    hasMore,
+    prevHint: tracePrevPageHint(org, project, traceId, flags),
+    nextHint: traceNextPageHint(org, project, traceId, flags),
+  });
+
+  let hint: string | undefined;
+  if (flatSpans.length === 0 && nav) {
+    hint = `No spans on this page. ${nav}`;
+  } else if (flatSpans.length > 0) {
+    const countText = `Showing ${flatSpans.length} span${flatSpans.length === 1 ? "" : "s"}.`;
+    hint = nav
+      ? `${countText} ${nav}`
+      : `${countText} Use '${sentry`span view ${traceId} <span-id>`}' to view span details.`;
+  }
+
+  return {
+    output: {
+      flatSpans,
+      hasMore,
+      hasPrev,
+      nextCursor,
+      traceId,
+      extraAttributes: extraApiFields,
+    },
+    hint,
+  };
+}
+
+/**
+ * Handle project mode: list spans across the entire project.
+ *
+ * Queries the spans dataset without a trace ID filter.
+ */
+async function handleProjectMode(
+  { org, project }: { readonly org: string; readonly project: string },
+  ctx: ModeContext,
+): Promise<{ output: SpanListData; hint?: string }> {
+  const { flags, extraApiFields, timeRange } = ctx;
+  // Resolve slug → numeric ID so the Events query scopes via the `project`
+  // param. `project:<slug>` only matches actively-selected projects (#1317).
+  const projectId = await resolveLogProjectId(org, project);
+  const apiQuery = flags.query ? translateSpanQuery(flags.query) : undefined;
+
+  const contextKey = buildPaginationContextKey(
+    "span-search",
+    `${org}/${project}`,
+    { sort: flags.sort, q: flags.query, period: serializeTimeRange(timeRange) },
+  );
+  const { cursor, direction } = resolveCursor(
+    flags.cursor,
+    PROJECT_PAGINATION_KEY,
+    contextKey,
+  );
+
+  const { data: spanItems, nextCursor } = await withProgress(
+    { message: `Fetching spans (up to ${flags.limit})...`, json: flags.json },
+    () =>
+      listSpans(org, project, {
+        query: apiQuery,
+        sort: flags.sort,
+        limit: flags.limit,
+        cursor,
+        projectId,
+        ...timeRangeToApiParams(timeRange),
+        extraFields: extraApiFields,
+      }).catch((error: unknown): never => {
+        // An unparseable user --query is a user input mistake, not a CLI bug.
+        throw toSearchQueryError(error, flags.query);
+      }),
+  );
+
+  // Update pagination state (handles both advance and truncation)
+  advancePaginationState(
+    PROJECT_PAGINATION_KEY,
+    contextKey,
+    direction,
+    nextCursor,
+  );
+  const hasPrev = hasPreviousPage(PROJECT_PAGINATION_KEY, contextKey);
+
+  const flatSpans = spanItems.map((item) =>
+    spanListItemToFlatSpan(item, extraApiFields),
+  );
+  const hasMore = !!nextCursor;
+
+  const nav = paginationHint({
+    hasPrev,
+    hasMore,
+    prevHint: projectPrevPageHint(org, project, flags),
+    nextHint: projectNextPageHint(org, project, flags),
+  });
+
+  let hint: string | undefined;
+  if (flatSpans.length === 0 && nav) {
+    hint = `No spans on this page. ${nav}`;
+  } else if (flatSpans.length > 0) {
+    const countText = `Showing ${flatSpans.length} span${flatSpans.length === 1 ? "" : "s"}.`;
+    hint = nav
+      ? `${countText} ${nav}`
+      : `${countText} Use '${sentry`span view <trace-id> <span-id>`}' to view span details.`;
+  }
+
+  return {
+    output: {
+      flatSpans,
+      hasMore,
+      hasPrev,
+      nextCursor,
+      org,
+      project,
+      extraAttributes: extraApiFields,
+    },
+    hint,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Command definition
+// ---------------------------------------------------------------------------
+
+export const listCommand = buildListCommand("span", {
+  docs: {
+    brief: "List spans in a project or trace",
+    fullDescription:
+      "List spans from a Sentry project, or within a specific trace.\n\n" +
+      `${TARGET_PATTERN_NOTE}\n\n` +
+      "Pass a 32-character trace ID to list the spans in one trace.\n\n" +
+      "Alias: `sentry spans` → `sentry span list`",
+    examples: [
+      {
+        description: "List recent spans in the current project",
+        run: "span list",
+      },
+      {
+        description: "Find all DB spans",
+        run: 'span list -q "op:db"',
+      },
+      {
+        description: "Slow spans in the last 24 hours",
+        run: 'span list -q "duration:>100ms" --period 24h',
+      },
+      {
+        description: "Sort by slowest first",
+        run: "span list --sort duration",
+      },
+      {
+        description: "List spans within a specific trace",
+        run: "span list abc123def456abc123def456abc12345",
+      },
+      {
+        description: "Show only spans from one project within a trace",
+        run: "span list my-org/cli-server/abc123def456abc123def456abc12345",
+      },
+      {
+        description: "Filter a trace's spans to several projects",
+        run: 'span list abc123def456abc123def456abc12345 -q "project:[cli-server,api]"',
+      },
+      {
+        description: "Fetch the next page",
+        run: "span list -c next",
+      },
+      {
+        description: "List spans in an explicit project",
+        run: "span list my-org/cli-server",
+      },
+      {
+        description: "Find a project across organizations, then list a trace",
+        run: "span list cli-server abc123def456abc123def456abc12345",
+      },
+      {
+        description: "Fetch the next page of a trace",
+        run: "span list abc123def456abc123def456abc12345 -c next",
+      },
+    ],
+  },
+  output: {
+    human: formatSpanListHuman,
+    jsonTransform: jsonTransformSpanList,
+    schema: FlatSpanSchema,
+  },
+  parameters: {
+    positional: boundArguments({
+      placeholder: "org/project/trace-id",
+      brief: "[<org>/<project>] or [<org>/<project>/]<trace-id>",
+      kind: ORG_PROJECT_TARGET,
+      parse: parseSpanListInput,
+      resolve: resolveSpanListTarget,
+    }),
+    flags: {
+      limit: {
+        kind: "parsed",
+        parse: textParser(parseLimit),
+        brief: `Number of spans (<=${LIST_MAX_LIMIT})`,
+        default: String(LIST_DEFAULT_LIMIT),
+      },
+      query: {
+        kind: "parsed",
+        parse: sanitizeQuery,
+        brief:
+          'Filter spans (e.g., "op:db", "project:backend", "project:[cli,api]")',
+        optional: true,
+      },
+      sort: {
+        kind: "parsed",
+        parse: choiceParser(VALID_SORT_VALUES, parseSort),
+        brief: `Sort order: ${VALID_SORT_VALUES.join(", ")}`,
+        default: DEFAULT_SORT,
+      },
+      period: LIST_PERIOD_FLAG,
+    },
+    aliases: {
+      ...PERIOD_ALIASES,
+      n: "limit",
+      q: "query",
+      s: "sort",
+    },
+  },
+  async *func(
+    this: SentryContext,
+    flags: ListFlags,
+    target: SpanListArguments,
+  ) {
+    const timeRange = flags.period;
+    const extraApiFields = extractExtraApiFields(flags.fields);
+    const modeCtx: ModeContext = { flags, timeRange, extraApiFields };
+
+    const resolved = await target.resolved;
+    const { output, hint } =
+      resolved.mode === "trace"
+        ? await handleTraceMode(resolved, modeCtx)
+        : await handleProjectMode(resolved, modeCtx);
+
+    yield new CommandOutput(output);
+    return { hint };
+  },
+});

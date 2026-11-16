@@ -1,26 +1,98 @@
 # GitHub Actions
 
-CI/CD workflows for the Sentry MCP project.
+Toolkit CI covers the CLI, MCP, and shared packages. The Cloudflare deployment
+workflows below serve the MCP, Docs MCP, and Games API Workers; CLI release and docs
+workflows are listed in the [CLI guide](../cli/README.md).
+
+`pnpm build` builds the MCP workspace; `pnpm build:cli` builds the imported CLI
+and docs when `SENTRY_CLIENT_ID` is available.
 
 ## Workflows
 
 ### test.yml
-Runs on all pushes to main and pull requests:
-- Build, lint, unit tests
-- Code coverage reporting
+
+Runs on pushes to `main`, pull requests, and merge queue entries. Discovery
+reads pnpm workspace projects and their package scripts. Pull requests check
+changed projects, their workspace consumers, and semantic dependencies (the CLI
+docs depend on `sentry`). Root-level changes and non-PR events check every
+enabled project. Each project has its own build, lint, typecheck, test, policy,
+and E2E steps when those scripts exist. The always-present `test` job checks
+discovery, installation, repository quality, and every selected project.
+It is the required status check for `main` and `release/**`, so no other
+job may use the check name `test`: GitHub would accept that check in its place.
+Package-specific checks and exceptions live in `package.json#sentryCi`; see
+[Package CI checks](#package-ci-checks). The standalone smoke-test suite remains
+in its own workflow.
 
 ### deploy.yml
-Runs after tests pass on main branch:
-- **Canary deployment**: Deploy to `sentry-mcp-canary` worker with isolated resources
-- **Smoke tests**: Test canary deployment
-- **Production deployment**: Deploy to `sentry-mcp` worker (only if canary tests pass)
-- **Production smoke tests**: Test production deployment
-- **Automatic rollback**: Rollback production if smoke tests fail
+
+Runs after a successful `Test` push run on `main`. Checks out the tested commit
+and requires that it is still the tip of `main`. Builds once, records the active
+production version, and uploads one new version of `sentry-mcp` from Vite's
+generated Worker config and `dist/client` assets. The source `public` directory
+does not contain the built SPA's `index.html`. It stages the candidate at 0%
+alongside the old version at 100%, then runs smoke tests through the production
+route with a version override on every request. The version endpoint confirms
+the override reaches the candidate. Only then does it promote the tested
+version to 100% and repeat the smoke tests. On failure,
+it restores the exact captured prior version only if the live deployments still
+belong to this run.
+
+Cloudflare can list the previous deployment first for a few seconds after a
+deploy succeeds, so every check that follows a deploy re-reads the deployment
+list for up to 30 seconds. Recovery fails rather than passing when Wrangler
+staged a candidate that Cloudflare never lists. A leftover stage (one version
+at 100%, the candidate at 0%) counts as its 100% version, so the next
+deployment can replace it. Failure messages name the check that failed.
+
+### deploy-docs-mcp.yml
+
+Uses the same successful `Test` push gate, tested `main` revision, and protected
+`production` secrets to deploy the existing private `docs-mcp` Worker. It uploads
+without moving traffic, checks that production is unchanged, activates the exact
+version, and verifies its ID, ownership marker, and 100% traffic in Cloudflare.
+It preserves runtime variables and secrets and keeps public URLs disabled.
+Private service-binding functionality must be checked through a real consumer.
+Disconnect the old Init Workers Builds connection before merging this workflow
+for its first deployment. See the [Docs MCP cutover guide](../../apps/docs-mcp/README.md#deployment-ownership).
+
+### deploy-games-api.yml
+
+Uses the same successful `Test` push gate and tested `main` revision to deploy
+the public `sentry-games-api` Worker. It runs on the Sentry Internal Cloudflare
+account, so it reads `GAMES_API_CLOUDFLARE_API_TOKEN` and
+`GAMES_API_CLOUDFLARE_ACCOUNT_ID` from `production` instead of the MCP
+credentials. It keeps runtime variables and secrets, then requests the public
+leaderboard until it returns `200`. See the
+[Games API README](../../apps/games-api/README.md#deployment-ownership).
+
+### recover-cloudflare-deployment.yml
+
+Manual `workflow_dispatch` recovery accepts a deployment run ID and attempt.
+It runs trusted current-`main` code in the protected `production` environment,
+checks the completed source run, and derives the prior version from contiguous
+run-owned Cloudflare deployment history. It refuses an intervening deployment,
+split or ambiguous traffic, or a marker mismatch. A successful restore is
+verified against Cloudflare and the live Worker. Recovery never builds or
+deploys source code from the old run. The first restored version may predate
+`/_health/version`; in that case, Cloudflare's active-version check and the
+functional smoke tests verify recovery while the version-route test accepts
+only its 404 response. When the route exists, the smoke test compares its
+version ID with the restored version.
+
+### migrate-cloudflare-token.yml
+
+Moves the Cloudflare API token from a repository secret into the protected
+`production` environment. Only `main` in the Toolkit repository can run it.
+Copy and removal are separate dispatches so a normal production deployment can
+prove that the environment copy works before the repository copy is deleted.
 
 ### eval.yml
+
 Runs evaluation tests against the MCP server.
 
 ### pr-risk-jev.yml
+
 Classifies PR risk with Jev and publishes one `risk: low`, `risk: medium`, or
 `risk: high` label. Runs when a non-draft PR is opened, updated with a push,
 reopened, marked ready for review, or edited. Manual dispatch accepts a PR number
@@ -34,16 +106,71 @@ are cleared and the PR stays unclassified. Results are retained as workflow
 artifacts for 30 days.
 
 ### pr-risk-labels-test.yml
+
 Runs the label publisher's regression tests when its workflow or tests change.
 Covers label replacement, stale revisions, failed classifications, and concurrent
 label creation.
 
+## Package CI checks
+
+Add a check for one workspace package to that package's `package.json`, not to
+a new workflow. `scripts/ci-projects.mjs` reads each package's scripts and its
+`sentryCi` object, and `test.yml` runs the result for every pull request that
+changes the package or one of its workspace dependencies. A path-filtered
+workflow for one package duplicates that selection and is not a required check.
+
+Each step runs a package script. Without a `sentryCi` override, the first
+script that exists is used:
+
+| Field        | Default scripts                | Notes                                                                                      |
+| ------------ | ------------------------------ | ------------------------------------------------------------------------------------------ |
+| `prepare`    | `ci:prepare`                   | Runs before the build.                                                                     |
+| `build`      | `build`                        |                                                                                            |
+| `lint`       | `lint`                         |                                                                                            |
+| `typecheck`  | `typecheck`, `tsc`, `check`    |                                                                                            |
+| `test`       | `test:ci`, `test:unit`, `test` |                                                                                            |
+| `policy`     | `ci:policy`                    |                                                                                            |
+| `e2e`        | `ci:e2e`, `test:e2e`           | Runs on Node 24 after the other steps.                                                     |
+| `npmRuntime` | none                           | Runs the script, packs the package, and runs its binary on Node 20, 22, and 24 and on Bun. |
+
+Set a field to a script name to override it, or to `false` to skip it. The
+other fields are:
+
+- `coverage`, `junit`: report paths the job verifies, or `false`.
+- `dependencies`: extra workspace packages whose changes select this one.
+- `enabled`: `false` removes the package from the matrix.
+- `roles`: names that `node scripts/ci-projects.mjs --roles NAME` resolves to
+  the package name and path, so a specialized workflow need not hard-code them.
+
+For example, `@sentry/logger` checks its packed tarball from a clean consumer
+project:
+
+```json
+{
+  "sentryCi": { "e2e": "test:package" },
+  "scripts": { "test:package": "bash test/package/check.sh" }
+}
+```
+
+A new workflow fits only when the matrix job cannot run the check: another
+operating system, a deployment, secrets, or pull request comments and labels.
+`scripts/workflow-policy.test.mjs` fails for a workflow that runs on pull
+requests unless its list names that workflow and the reason.
+
 ## Required Secrets
 
-Repository secrets (no environment needed):
+The `production` environment is restricted to `main` and holds:
 
 - **`CLOUDFLARE_API_TOKEN`** - Cloudflare API token with Workers deployment permissions
-- **`CLOUDFLARE_ACCOUNT_ID`** - Your Cloudflare account ID  
+
+During migration, the same name also exists as a repository secret. A temporary
+`CLOUDFLARE_MIGRATION_PAT` environment secret gives the migration workflow
+permission to write environment secrets and delete the repository copy. The
+workflow deletes this PAT secret after successful cleanup.
+
+Other configuration:
+
+- **`CLOUDFLARE_ACCOUNT_ID`** - ID of the account owning the Workers
 - **`SENTRY_AUTH_TOKEN`** - For Sentry release tracking
 - **`SENTRY_CLIENT_SECRET`** - Sentry OAuth client secret
 - **`COOKIE_SECRET`** - Session cookie encryption secret
@@ -53,31 +180,63 @@ Repository secrets (no environment needed):
 ## Deployment Architecture
 
 ### Workers
+
 - **`sentry-mcp`** - Production worker at `https://mcp.sentry.dev`
-- **`sentry-mcp-canary`** - Canary worker at `https://sentry-mcp-canary.getsentry.workers.dev`
+- The candidate is tested on the production Worker at 0% traffic before promotion.
 
 ### Resource Isolation
-Canary and production use separate resources for complete isolation:
 
-| Resource | Production | Canary |
-|----------|------------|---------|
-| KV Namespace | `8dd5e9bafe1945298e2d5ca3b408a553` | `a3fe0d23b2d34416930e284362a88a3b` |
-| Rate Limiter IDs | `1001`, `1002`, `1003`, `1004` | `2001`, `2002`, `2003`, `2004` |
-| Wrangler Config | `wrangler.jsonc` | `wrangler.canary.jsonc` |
+The existing canary Worker has separate resources; exact-version rollout does
+not deploy it. The production candidate uses the production bindings:
+
+| Resource         | Production                         | Canary                             |
+| ---------------- | ---------------------------------- | ---------------------------------- |
+| KV Namespace     | `8dd5e9bafe1945298e2d5ca3b408a553` | `a3fe0d23b2d34416930e284362a88a3b` |
+| Rate Limiter IDs | `1001`, `1002`, `1003`, `1004`     | `2001`, `2002`, `2003`, `2004`     |
+| Wrangler Config  | `wrangler.jsonc`                   | `wrangler.canary.jsonc`            |
 
 ### Deployment Flow
-1. **Build once** - Single build for both deployments
-2. **Deploy canary** - `wrangler deploy --config wrangler.canary.jsonc`
-3. **Wait 30s** - Allow propagation
-4. **Test canary** - Run smoke tests against canary worker
-5. **Deploy production** - `wrangler deploy` (only if canary tests pass)
-6. **Wait 30s** - Allow propagation  
-7. **Test production** - Run smoke tests against production worker
-8. **Rollback** - `wrangler rollback` if production tests fail
+
+The workflow never deploys an untested revision or a stale `main` commit.
+When `main` has advanced past the tested commit before the deploy starts, the
+deploy job is skipped, not failed; the newer commit's `Test` run deploys it.
+If `main` advances after that check, the deploy job's own revision checks fail it.
+Failure to identify the prior active version, verify deployment ownership, or
+confirm the restored version fails the job rather than guessing a recovery.
 
 ## Manual Deployment
 
-Trigger via GitHub Actions → Deploy to Cloudflare → "Run workflow"
+Manual dispatch cannot deploy a new revision. Use a reviewed change and its
+passing `Test` run to deploy. For the main `sentry-mcp` Worker, restore an owned
+deployment after its runner has stopped by dispatching `Recover Cloudflare
+Deployment` from `main` with the failed deployment run ID and attempt. Verify
+the active Cloudflare version and live smoke-test result; if ownership has
+changed, investigate rather than retrying against mutable history. This recovery
+workflow does not target Docs MCP. Never run bare `wrangler rollback`.
+
+## Cloudflare token migration
+
+1. Merge the reviewed migration workflow into `main`. Create a fine-grained PAT
+   for `getsentry/toolkit` with repository **Secrets: read/write** permission.
+   Store it as `CLOUDFLARE_MIGRATION_PAT` in the protected `production`
+   environment. Never pass the PAT in a workflow input or command argument.
+2. Dispatch `Move Cloudflare token to production environment` on `main` with
+   `operation=copy`. Confirm success and check that `CLOUDFLARE_API_TOKEN`
+   appears in both repository and `production` environment secret-name lists.
+3. Wait for a normal `Test` push on `main` to trigger `Deploy to Cloudflare`.
+   Confirm that the deployment passed canary and production smoke tests and
+   served the intended revision. Record its workflow run ID; its start time
+   must be after the environment secret was copied.
+4. Dispatch the migration workflow again on `main` with `operation=remove` and
+   that successful deployment run ID. The workflow checks the run's identity,
+   result, timing, and successful canary and production deployment and smoke-test
+   steps, then deletes the repository-scoped Cloudflare token.
+   Check that only the environment copy remains and the temporary PAT secret
+   has been removed. Revoke the PAT after use.
+
+If a step fails, keep the repository copy until a successful post-copy
+deployment has been verified. Never print either credential while diagnosing
+the failure.
 
 ## Troubleshooting
 

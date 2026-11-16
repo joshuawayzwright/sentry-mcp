@@ -1,4 +1,3 @@
-import { setTag } from "@sentry/core";
 import { z } from "zod";
 import type { IssueAlertRule } from "../../api-client/types";
 import { UserInputError } from "../../errors";
@@ -10,7 +9,7 @@ import {
   ParamProjectSlugOrAll,
   ParamRegionUrl,
 } from "../../schema";
-import { setOrganizationContext } from "../../telem/organization";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
 import type { ServerContext } from "../../types";
 import {
   getMetricMonitorReference,
@@ -100,6 +99,7 @@ function getOwner(owner: unknown): string | null {
 
 export default defineTool({
   name: "find_alert_rules",
+  title: "Find Alert Rules",
   skills: ["inspect"],
   requiredScopes: ["org:read", "project:read"],
   description: [
@@ -174,10 +174,7 @@ export default defineTool({
       regionUrl: params.regionUrl ?? undefined,
     });
     const organizationSlug = params.organizationSlug;
-    setOrganizationContext(organizationSlug);
-    if (projectSlug) {
-      setTag("project.slug", projectSlug);
-    }
+    setTargetTagsAndAttributes({ organizationSlug, projectSlug });
 
     const includeIssue = params.kind !== "metric";
     const includeMetric = params.kind !== "issue";

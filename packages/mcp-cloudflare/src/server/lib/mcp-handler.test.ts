@@ -1,4 +1,8 @@
 import type { ExecutionContext, RateLimit } from "@cloudflare/workers-types";
+import {
+  createExecutionContext,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DIRECT_AUTH_ASSERTION_TOKEN } from "../../test-utils/fetch-mock-setup";
 import type { Env } from "../types";
@@ -8,7 +12,8 @@ const { sentryMetricsCount, sentrySetUser } = vi.hoisted(() => ({
   sentrySetUser: vi.fn(),
 }));
 
-vi.mock("@sentry/cloudflare", () => ({
+vi.mock("@sentry/cloudflare", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@sentry/cloudflare")>()),
   getActiveSpan: vi.fn(() => undefined),
   metrics: {
     count: sentryMetricsCount,
@@ -16,6 +21,10 @@ vi.mock("@sentry/cloudflare", () => ({
   setUser: sentrySetUser,
 }));
 
+import {
+  MAX_MCP_REQUEST_BODY_BYTES,
+  MAX_TOOL_INPUT_ELEMENTS,
+} from "@sentry/toolkit-core/mcp-limits";
 import mcpHandler, { handleSentryBearerMcpRequest } from "./mcp-handler";
 import {
   OAUTH_GRANT_AGE_BUCKET_ATTRIBUTE,
@@ -53,7 +62,7 @@ function createMcpContext(
       ...DEFAULT_OAUTH_PROPS,
       ...props,
     },
-  } as ExecutionContext & { props: OAuthProps };
+  };
 }
 
 function createMcpRequest(
@@ -288,8 +297,9 @@ describe("MCP Handler", () => {
       }>(response);
       const toolNames = body.result?.tools.map((tool) => tool.name) ?? [];
 
-      expect(toolNames).toContain("search_events");
-      expect(toolNames).not.toContain("search_docs");
+      expect(toolNames).toContain("search_traces");
+      expect(toolNames).toContain("search_docs");
+      expect(toolNames).not.toContain("update_issue");
     });
 
     it("applies the authenticated MCP rate limit per user", async () => {
@@ -343,7 +353,7 @@ describe("MCP Handler", () => {
       }>(response);
       const toolNames = body.result?.tools.map((tool) => tool.name) ?? [];
 
-      expect(toolNames).toContain("search_events");
+      expect(toolNames).toContain("search_traces");
       expect(toolNames).toContain("update_issue");
     });
 
@@ -351,11 +361,8 @@ describe("MCP Handler", () => {
       const request = createMcpRequest(
         "tools/call",
         {
-          name: "execute_sentry_tool",
-          arguments: {
-            name: "whoami",
-            arguments: {},
-          },
+          name: "whoami",
+          arguments: {},
         },
         { headers: { "X-Sentry-Utm-Source": "plugin" } },
       );
@@ -398,7 +405,7 @@ describe("MCP Handler", () => {
           content: [
             {
               type: "text",
-              text: JSON.stringify(structuredContent, null, 2),
+              text: JSON.stringify(structuredContent),
             },
           ],
           structuredContent,
@@ -480,7 +487,7 @@ describe("MCP Handler", () => {
       }>(response);
       const toolNames = body.result?.tools.map((tool) => tool.name) ?? [];
 
-      expect(toolNames).toContain("search_events");
+      expect(toolNames).toContain("search_traces");
       expect(toolNames).not.toContain("update_issue");
     });
 
@@ -508,7 +515,7 @@ describe("MCP Handler", () => {
       }>(response);
       const toolNames = body.result?.tools.map((tool) => tool.name) ?? [];
 
-      expect(toolNames).toContain("search_events");
+      expect(toolNames).toContain("search_traces");
       expect(toolNames).not.toContain("update_issue");
     });
 
@@ -560,6 +567,135 @@ describe("MCP Handler", () => {
   });
 
   describe("URL constraints", () => {
+    it("rejects upstream permission failures with cached unknown capabilities", async () => {
+      const env = createTestEnv();
+      const timeoutKey =
+        "timeout:caps:v1:test-user-123:sentry.io:test-org:project:test-project";
+      env.MCP_CACHE = {
+        get: vi.fn().mockImplementation(async (key: string) =>
+          key === timeoutKey
+            ? {
+                regionUrl: "https://us.sentry.io",
+                projectCapabilities: null,
+                cachedAt: Date.now(),
+              }
+            : null,
+        ),
+        put: vi.fn(),
+      };
+      const ctx = createMcpContext({
+        accessToken: "test-current-user-token",
+        grantedSkills: ["inspect"],
+        constraintOrganizationSlug: "test-org",
+        constraintProjectSlug: "test-project",
+      });
+      const profileId = "00000000000040008000000000000001";
+      const profileUrl = `https://us.sentry.io/api/0/projects/test-org/test-project/profiling/profiles/${profileId}/`;
+      const request = createMcpRequest(
+        "tools/call",
+        {
+          name: "get_profile_details",
+          arguments: { profileId },
+        },
+        { path: "/mcp/test-org/test-project" },
+      );
+      const originalFetch = globalThis.fetch;
+      const apiFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation((input, init) => {
+          const url = input instanceof Request ? input.url : String(input);
+          if (url === profileUrl) {
+            return Promise.resolve(
+              Response.json(
+                {
+                  detail: "You do not have permission to perform this action.",
+                },
+                { status: 403 },
+              ),
+            );
+          }
+          return originalFetch(input, init);
+        });
+
+      try {
+        const response = await mcpHandler.fetch!(request, env, ctx);
+
+        expect(response.status).toBe(200);
+        const body = await parseSSEResponse<{
+          result: {
+            isError?: boolean;
+            content: Array<{ type: string; text: string }>;
+          };
+        }>(response);
+        expect(body.result.isError).toBe(true);
+        expect(body.result.content).toEqual([
+          { type: "text", text: expect.stringContaining("HTTP 403") },
+        ]);
+        expect(env.MCP_CACHE.put).not.toHaveBeenCalled();
+        expect(apiFetch).toHaveBeenCalledOnce();
+        const [url, init] = apiFetch.mock.calls[0] ?? [];
+        expect(url).toBe(profileUrl);
+        expect(new Headers(init?.headers).get("Authorization")).toBe(
+          `Bearer ${ctx.props.accessToken}`,
+        );
+      } finally {
+        apiFetch.mockRestore();
+      }
+    });
+
+    it("keeps the constraint cache write alive after returning the response", async () => {
+      let finishWrite!: () => void;
+      const writeReady = new Promise<void>((resolve) => {
+        finishWrite = resolve;
+      });
+      let stored: unknown = null;
+      const env = createTestEnv();
+      env.MCP_CACHE = {
+        get: vi.fn().mockResolvedValue(null),
+        put: vi.fn().mockImplementation(async (_key: string, value: string) => {
+          await writeReady;
+          stored = JSON.parse(value);
+        }),
+      };
+      const ctx = Object.assign(createExecutionContext(), {
+        props: { ...DEFAULT_OAUTH_PROPS },
+      });
+      const request = createMcpRequest(
+        "initialize",
+        {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "test-client", version: "1.0.0" },
+        },
+        { path: "/mcp/sentry-mcp-evals/cloudflare-mcp" },
+      );
+
+      try {
+        const response = await mcpHandler.fetch!(request, env, ctx);
+        expect(response.status).toBe(200);
+        const body = await parseSSEResponse<{
+          result: { protocolVersion: string };
+        }>(response);
+        expect(body.result.protocolVersion).toBeDefined();
+        expect(stored).toBeNull();
+
+        let backgroundCompleted = false;
+        const background = waitOnExecutionContext(ctx).then(() => {
+          backgroundCompleted = true;
+        });
+        // Let completed tasks drain; only the blocked KV write should remain.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(backgroundCompleted).toBe(false);
+
+        finishWrite();
+        await background;
+        expect(stored).not.toBeNull();
+      } finally {
+        finishWrite();
+        await waitOnExecutionContext(ctx);
+      }
+    });
+
     it("should handle /mcp without constraints", async () => {
       const request = createMcpRequest(
         "initialize",
@@ -749,38 +885,130 @@ describe("MCP Handler", () => {
       }>(response);
       const toolNames = body.result?.tools.map((tool) => tool.name) ?? [];
 
-      expect(toolNames).toContain("search_sentry_tools");
-      expect(toolNames).not.toContain("search_docs");
-      expect(toolNames).not.toContain("get_doc");
+      expect(toolNames).toContain("search_docs");
+      expect(toolNames).toContain("get_doc");
       expect(toolNames).not.toContain("get_issue_details");
+      expect(toolNames).not.toContain("search_sentry_tools");
+    });
+  });
 
-      const searchRequest = createMcpRequest("tools/call", {
-        name: "search_sentry_tools",
+  describe("request limits", () => {
+    function createDirectContext(): ExecutionContext {
+      return {
+        waitUntil: vi.fn(),
+        passThroughOnException: vi.fn(),
+      } as unknown as ExecutionContext;
+    }
+
+    function callPaddedTool(padding: string): Request {
+      return createMcpRequest("tools/call", {
+        name: "get_sentry_mcp_info",
+        arguments: {},
+        _meta: { padding },
+      });
+    }
+
+    it("accepts a tool call whose body is just under the size limit", async () => {
+      const emptyBodyBytes = (await callPaddedTool("").text()).length;
+      const request = callPaddedTool(
+        "a".repeat(MAX_MCP_REQUEST_BODY_BYTES - emptyBodyBytes),
+      );
+
+      const response = await handleSentryBearerMcpRequest(
+        request,
+        createTestEnv(),
+        createDirectContext(),
+        "sntryu_test-token",
+      );
+
+      expect(response.status).toBe(200);
+      const body = await parseSSEResponse<{
+        result?: { isError?: boolean };
+      }>(response);
+      expect(body.result).toBeDefined();
+      expect(body.result?.isError).toBeFalsy();
+    });
+
+    it("rejects a body over the size limit with a declared Content-Length", async () => {
+      const request = callPaddedTool("a".repeat(MAX_MCP_REQUEST_BODY_BYTES));
+
+      const response = await handleSentryBearerMcpRequest(
+        request,
+        createTestEnv(),
+        createDirectContext(),
+        "sntryu_test-token",
+      );
+
+      expect(response.status).toBe(413);
+      expect(await response.json()).toEqual({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: `Payload Too Large: Request body must not exceed ${MAX_MCP_REQUEST_BODY_BYTES} bytes`,
+        },
+        id: null,
+      });
+    });
+
+    it("rejects a streamed body over the size limit without Content-Length", async () => {
+      const chunk = new TextEncoder().encode("a".repeat(64 * 1024));
+      let sent = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent > MAX_MCP_REQUEST_BODY_BYTES) {
+            controller.close();
+            return;
+          }
+          sent += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+      });
+      const request = new Request("http://localhost/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          Host: "localhost",
+        },
+        body: stream,
+      });
+      expect(request.headers.get("content-length")).toBeNull();
+
+      const response = await handleSentryBearerMcpRequest(
+        request,
+        createTestEnv(),
+        createDirectContext(),
+        "sntryu_test-token",
+      );
+
+      expect(response.status).toBe(413);
+    });
+
+    it("rejects tool arguments over the element limit before running the tool", async () => {
+      const request = createMcpRequest("tools/call", {
+        name: "search_errors",
         arguments: {
-          query: "documentation",
-          limit: 10,
+          organizationSlug: "sentry-mcp-evals",
+          query: "errors",
+          fields: Array.from({ length: MAX_TOOL_INPUT_ELEMENTS }, () => "id"),
         },
       });
 
-      const searchResponse = await mcpHandler.fetch!(
-        searchRequest,
+      const response = await handleSentryBearerMcpRequest(
+        request,
         createTestEnv(),
-        ctx,
+        createDirectContext(),
+        "sntryu_test-token",
       );
 
-      expect(searchResponse.status).toBe(200);
-      const searchBody = await parseSSEResponse<{
-        result?: {
-          structuredContent?: { results?: Array<{ name: string }> };
-        };
-      }>(searchResponse);
-      const catalogToolNames =
-        searchBody.result?.structuredContent?.results?.map(
-          (tool) => tool.name,
-        ) ?? [];
-
-      expect(catalogToolNames).toContain("search_docs");
-      expect(catalogToolNames).toContain("get_doc");
+      expect(response.status).toBe(200);
+      const body = await parseSSEResponse<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(response);
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toBe(
+        `Invalid arguments for tool search_errors: arguments contain more than the maximum of ${MAX_TOOL_INPUT_ELEMENTS} elements`,
+      );
     });
   });
 });

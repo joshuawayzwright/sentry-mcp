@@ -1,0 +1,351 @@
+/**
+ * sentry trace list
+ *
+ * List recent traces from Sentry projects.
+ */
+
+import type { SentryContext } from "../../context.js";
+import { listTransactions } from "../../lib/api-client.js";
+import { sentry } from "../../lib/app-identity.js";
+import { validateLimit } from "../../lib/arg-parsing.js";
+import { choiceParser, textParser } from "../../lib/completion-target.js";
+import {
+  advancePaginationState,
+  buildPaginationContextKey,
+  hasPreviousPage,
+  resolveCursor,
+} from "../../lib/db/pagination.js";
+import { toSearchQueryError } from "../../lib/errors.js";
+import { formatTraceTable } from "../../lib/formatters/index.js";
+import { filterFields } from "../../lib/formatters/json.js";
+import { CommandOutput } from "../../lib/formatters/output.js";
+import {
+  appendQueryHint,
+  buildListCommand,
+  LIST_DEFAULT_LIMIT,
+  LIST_MAX_LIMIT,
+  LIST_MIN_LIMIT,
+  LIST_PERIOD_FLAG,
+  PERIOD_ALIASES,
+  PROJECT_TARGET_BRIEF,
+  paginationHint,
+  TARGET_PATTERN_NOTE,
+} from "../../lib/list-command.js";
+import type { ListEnvelope } from "../../lib/org-list.js";
+import { withProgress } from "../../lib/polling.js";
+import { resolveLogProjectId } from "../../lib/resolve-target.js";
+import { sanitizeQuery } from "../../lib/search-query.js";
+import {
+  type ProjectBoundTarget,
+  projectBoundTarget,
+} from "../../lib/target-positional.js";
+import {
+  appendPeriodHint,
+  serializeTimeRange,
+  type TimeRange,
+  timeRangeToApiParams,
+} from "../../lib/time-range.js";
+import type { TransactionListItem } from "../../types/index.js";
+import { TransactionListItemSchema } from "../../generated/output-schemas/trace.js";
+
+type ListFlags = {
+  readonly limit: number;
+  readonly query?: string;
+  readonly sort: "date" | "duration";
+  readonly period: TimeRange;
+  readonly json: boolean;
+  readonly cursor?: string;
+  readonly fresh: boolean;
+  readonly fields?: string[];
+};
+
+type SortValue = "date" | "duration";
+
+/**
+ * Result data for the trace list command.
+ *
+ * Contains the traces array plus pagination metadata and context
+ * needed by both the human formatter and JSON transform.
+ */
+type TraceListResult = {
+  /** The list of transactions returned by the API */
+  traces: TransactionListItem[];
+  /** Whether more pages are available */
+  hasMore: boolean;
+  /** Whether a previous page exists (for bidirectional hints) */
+  hasPrev?: boolean;
+  /** Opaque cursor for fetching the next page (null/undefined when no more) */
+  nextCursor?: string | null;
+  /** Org slug (used by human formatter for display and next-page hint) */
+  org: string;
+  /** Project slug (used by human formatter for display and next-page hint) */
+  project: string;
+};
+
+/** Accepted values for the --sort flag */
+const VALID_SORT_VALUES: SortValue[] = ["date", "duration"];
+
+/** Command key for pagination cursor storage */
+export const PAGINATION_KEY = "trace-list";
+
+/** Default time period for trace queries */
+const DEFAULT_PERIOD = "7d";
+
+/** Append active non-default flags to a base command string. */
+function appendTraceFlags(
+  base: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  const parts: string[] = [];
+  if (flags.sort !== "date") {
+    parts.push(`--sort ${flags.sort}`);
+  }
+  appendQueryHint(parts, flags.query);
+  appendPeriodHint(parts, flags.period, DEFAULT_PERIOD);
+  return parts.length > 0 ? `${base} ${parts.join(" ")}` : base;
+}
+
+/** Build the CLI hint for fetching the next page, preserving active flags. */
+function nextPageHint(
+  org: string,
+  project: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  return appendTraceFlags(sentry`trace list ${org}/${project} -c next`, flags);
+}
+
+/** Build the CLI hint for fetching the previous page, preserving active flags. */
+function prevPageHint(
+  org: string,
+  project: string,
+  flags: Pick<ListFlags, "sort" | "query" | "period">,
+): string {
+  return appendTraceFlags(sentry`trace list ${org}/${project} -c prev`, flags);
+}
+
+/**
+ * Parse --limit flag, delegating range validation to shared utility.
+ */
+function parseLimit(value: string): number {
+  return validateLimit(value, LIST_MIN_LIMIT, LIST_MAX_LIMIT);
+}
+
+/**
+ * Parse and validate sort flag value.
+ *
+ * @throws Error if value is not "date" or "duration"
+ * @internal Exported for testing
+ */
+export function parseSort(value: string): SortValue {
+  if (!VALID_SORT_VALUES.includes(value as SortValue)) {
+    throw new Error(
+      `Invalid sort value. Must be one of: ${VALID_SORT_VALUES.join(", ")}`,
+    );
+  }
+  return value as SortValue;
+}
+
+/**
+ * Format trace list data for human-readable terminal output.
+ *
+ * Handles three display states:
+ * - Empty list with more pages → "No traces on this page."
+ * - Empty list, no more pages → "No traces found."
+ * - Non-empty → header line + formatted table
+ */
+function formatTraceListHuman(result: TraceListResult): string {
+  const { traces, hasMore, org, project } = result;
+
+  if (traces.length === 0) {
+    return hasMore ? "No traces on this page." : "No traces found.";
+  }
+
+  return `Recent traces in ${org}/${project}:\n\n${formatTraceTable(traces)}`;
+}
+
+/**
+ * Transform trace list data into the JSON list envelope.
+ *
+ * Produces the standard `{ data, hasMore, nextCursor? }` envelope.
+ * Field filtering is applied per-element inside `data` (not to the
+ * wrapper), matching the behaviour of `writeJsonList`.
+ */
+function jsonTransformTraceList(
+  result: TraceListResult,
+  fields?: string[],
+): ListEnvelope<TransactionListItem> {
+  const items =
+    fields && fields.length > 0
+      ? result.traces.map((t) => filterFields(t, fields))
+      : result.traces;
+
+  const envelope: ListEnvelope<TransactionListItem> = {
+    data: items,
+    hasMore: result.hasMore,
+    hasPrev: !!result.hasPrev,
+  };
+  if (
+    result.nextCursor !== null &&
+    result.nextCursor !== undefined &&
+    result.nextCursor !== ""
+  ) {
+    envelope.nextCursor = result.nextCursor;
+  }
+  return envelope;
+}
+
+export const listCommand = buildListCommand("trace", {
+  docs: {
+    brief: "List recent traces in a project",
+    fullDescription:
+      "List recent traces from Sentry projects.\n\n" +
+      `${TARGET_PATTERN_NOTE}\n\n` +
+      "Alias: `sentry traces` → `sentry trace list`",
+    examples: [
+      { description: "List recent traces", run: "trace list" },
+      {
+        description: "Show more traces",
+        run: "trace list --limit 50",
+      },
+      {
+        description: "Sort by slowest first",
+        run: "trace list --sort duration",
+      },
+      {
+        description: "Filter by transaction name in the last 24 hours",
+        run: 'trace list -q "transaction:GET /api/users" --period 24h',
+      },
+      {
+        description: "Fetch the next page",
+        run: "trace list my-org/backend -c next",
+      },
+      {
+        description: "Find a project across organizations",
+        run: "trace list backend",
+      },
+    ],
+  },
+  output: {
+    human: formatTraceListHuman,
+    jsonTransform: jsonTransformTraceList,
+    schema: TransactionListItemSchema,
+  },
+  parameters: {
+    positional: {
+      kind: "tuple",
+      parameters: [
+        {
+          placeholder: "org/project",
+          brief: PROJECT_TARGET_BRIEF,
+          parse: projectBoundTarget,
+          optional: true,
+        },
+      ],
+    },
+    flags: {
+      limit: {
+        kind: "parsed",
+        parse: textParser(parseLimit),
+        brief: `Number of traces (${LIST_MIN_LIMIT}-${LIST_MAX_LIMIT})`,
+        default: String(LIST_DEFAULT_LIMIT),
+      },
+      query: {
+        kind: "parsed",
+        parse: sanitizeQuery,
+        brief: "Search query (Sentry search syntax)",
+        optional: true,
+      },
+      sort: {
+        kind: "parsed",
+        parse: choiceParser(VALID_SORT_VALUES, parseSort),
+        brief: "Sort by: date, duration",
+        default: "date" as const,
+      },
+      period: LIST_PERIOD_FLAG,
+    },
+    aliases: {
+      ...PERIOD_ALIASES,
+      n: "limit",
+      q: "query",
+      s: "sort",
+    },
+  },
+  async *func(
+    this: SentryContext,
+    flags: ListFlags,
+    target: ProjectBoundTarget,
+  ) {
+    const timeRange = flags.period;
+    const { query } = flags;
+
+    // Resolve org/project from positional arg, config, or DSN auto-detection
+    const { org, project } = await target.resolved;
+    // Resolve slug → numeric ID so the Events query scopes via the `project`
+    // param. `project:<slug>` only matches actively-selected projects and can
+    // otherwise 400 with "not actively selected" (#1317).
+    const projectId = await resolveLogProjectId(org, project);
+    // Build context key and resolve cursor for pagination
+    const contextKey = buildPaginationContextKey("trace", `${org}/${project}`, {
+      sort: flags.sort,
+      q: query,
+      period: serializeTimeRange(timeRange),
+    });
+    const { cursor, direction } = resolveCursor(
+      flags.cursor,
+      PAGINATION_KEY,
+      contextKey,
+    );
+
+    const { data: traces, nextCursor } = await withProgress(
+      {
+        message: `Fetching traces (up to ${flags.limit})...`,
+        json: flags.json,
+      },
+      () =>
+        listTransactions(org, project, {
+          query,
+          limit: flags.limit,
+          sort: flags.sort,
+          cursor,
+          projectId,
+          ...timeRangeToApiParams(timeRange),
+        }).catch((error: unknown): never => {
+          // An unparseable user --query is a user input mistake, not a CLI bug.
+          throw toSearchQueryError(error, flags.query);
+        }),
+    );
+
+    // Update pagination state (handles both advance and truncation)
+    advancePaginationState(PAGINATION_KEY, contextKey, direction, nextCursor);
+    const hasPrev = hasPreviousPage(PAGINATION_KEY, contextKey);
+
+    const hasMore = !!nextCursor;
+
+    // Build footer hint based on result state
+    const nav = paginationHint({
+      hasMore,
+      hasPrev,
+      prevHint: prevPageHint(org, project, flags),
+      nextHint: nextPageHint(org, project, flags),
+    });
+    let hint: string | undefined;
+    if (traces.length === 0 && nav) {
+      hint = `No traces on this page. ${nav}`;
+    } else if (traces.length > 0) {
+      const countText = `Showing ${traces.length} trace${traces.length === 1 ? "" : "s"}.`;
+      hint = nav
+        ? `${countText} ${nav}`
+        : `${countText} Use '${sentry`trace view <TRACE_ID>`}' to view the full span tree.`;
+    }
+
+    yield new CommandOutput({
+      traces,
+      hasMore,
+      hasPrev,
+      nextCursor,
+      org,
+      project,
+    });
+    return { hint };
+  },
+});

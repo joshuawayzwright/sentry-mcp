@@ -1,0 +1,506 @@
+/**
+ * Replay View Command Tests
+ */
+
+import type { ArgumentParseError } from "@stricli/core";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  parseReplayArguments,
+  type ReplayArguments,
+  replayArguments,
+  viewCommand,
+} from "../../../src/commands/replay/view.js";
+
+vi.mock("../../../src/lib/api-client.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../../src/lib/api-client.js")>();
+  return Object.fromEntries(
+    Object.entries(actual).map(([k, v]) => [
+      k,
+      typeof v === "function" ? vi.fn(v) : v,
+    ]),
+  );
+});
+
+// oxlint-disable-next-line sentry-cli/no-namespace-import -- needed for spyOn mocking
+import * as apiClient from "../../../src/lib/api-client.js";
+
+vi.mock("../../../src/lib/browser.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../../src/lib/browser.js")>();
+  return Object.fromEntries(
+    Object.entries(actual).map(([k, v]) => [
+      k,
+      typeof v === "function" ? vi.fn(v) : v,
+    ]),
+  );
+});
+
+// oxlint-disable-next-line sentry-cli/no-namespace-import -- needed for spyOn mocking
+import * as browser from "../../../src/lib/browser.js";
+import {
+  ApiError,
+  ContextError,
+  HostScopeError,
+  ResolutionError,
+  ValidationError,
+} from "../../../src/lib/errors.js";
+
+vi.mock("../../../src/lib/resolve-target.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../../src/lib/resolve-target.js")>();
+  return Object.fromEntries(
+    Object.entries(actual).map(([k, v]) => [
+      k,
+      typeof v === "function" ? vi.fn(v) : v,
+    ]),
+  );
+});
+
+import { applyBoundPositionals } from "../../../src/lib/positional-parse.js";
+// oxlint-disable-next-line sentry-cli/no-namespace-import -- needed for spyOn mocking
+import * as resolveTarget from "../../../src/lib/resolve-target.js";
+import type { ReplayDetails } from "../../../src/types/index.js";
+
+const REPLAY_ID = "346789a703f6454384f1de473b8b9fcc";
+const TRACE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+function sampleReplay(overrides: Partial<ReplayDetails> = {}): ReplayDetails {
+  return {
+    id: REPLAY_ID,
+    count_errors: 2,
+    count_segments: 5,
+    duration: 125,
+    error_ids: [],
+    info_ids: [],
+    started_at: "2025-01-30T14:32:15+00:00",
+    tags: {},
+    project_id: "42",
+    trace_ids: [TRACE_ID],
+    urls: [],
+    user: { display_name: "Test User" },
+    warning_ids: [],
+    ...overrides,
+  };
+}
+
+describe("parseReplayArguments", () => {
+  const ORG_ALL = { type: "org-all", org: "test-org" };
+  const EXPLICIT = { type: "explicit", org: "test-org", project: "cli" };
+
+  test("parses replay ID only", () => {
+    const result = parseReplayArguments([REPLAY_ID]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual({ type: "auto-detect" });
+  });
+
+  test("parses org/replay-id shorthand", () => {
+    const result = parseReplayArguments([`test-org/${REPLAY_ID}`]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(ORG_ALL);
+  });
+
+  test("normalizes dashed org/replay-id shorthand", () => {
+    const result = parseReplayArguments([
+      "test-org/346789a7-03f6-4543-84f1-de473b8b9fcc",
+    ]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(ORG_ALL);
+  });
+
+  test("parses org/project/replay-id form", () => {
+    const result = parseReplayArguments([`test-org/cli/${REPLAY_ID}`]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(EXPLICIT);
+  });
+
+  test("ignores a slash pasted after the replay ID", () => {
+    const result = parseReplayArguments([`test-org/cli/${REPLAY_ID}/`]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(EXPLICIT);
+  });
+
+  test("parses target and replay ID as two arguments", () => {
+    const result = parseReplayArguments(["test-org/cli", REPLAY_ID]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(EXPLICIT);
+    expect(result.warnings).toEqual([]);
+  });
+
+  test("parses replay URL", () => {
+    const result = parseReplayArguments([
+      `https://sentry.io/organizations/test-org/explore/replays/${REPLAY_ID}/`,
+    ]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(ORG_ALL);
+    expect(result.baseUrl).toBe("https://sentry.io");
+  });
+
+  test("parses legacy replay URL", () => {
+    const result = parseReplayArguments([
+      `https://test-org.sentry.io/replays/${REPLAY_ID}/`,
+    ]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(ORG_ALL);
+  });
+
+  test("throws ContextError for a Sentry URL without a replay ID", () => {
+    expect(() =>
+      parseReplayArguments(["https://sentry.io/organizations/test-org/"]),
+    ).toThrow(ContextError);
+  });
+
+  test("detects swapped args", () => {
+    const result = parseReplayArguments([REPLAY_ID, "test-org/cli"]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual(EXPLICIT);
+    expect(result.warnings).toEqual([
+      `Arguments appear reversed. Interpreting as: test-org/cli ${REPLAY_ID}`,
+    ]);
+  });
+
+  test("throws ContextError without arguments", () => {
+    expect(() => parseReplayArguments([])).toThrow(ContextError);
+    expect(() => parseReplayArguments([" "])).toThrow(ContextError);
+    expect(() => parseReplayArguments(["test-org/cli", ""])).toThrow(
+      ContextError,
+    );
+  });
+
+  test("an empty target before the replay ID auto-detects", () => {
+    // e.g. `sentry replay view "$ORG" <replay-id>` with `$ORG` unset
+    const result = parseReplayArguments(["", REPLAY_ID]);
+    expect(result.replayId).toBe(REPLAY_ID);
+    expect(result.target).toEqual({ type: "auto-detect" });
+  });
+
+  test("throws ContextError for org/project with no replay ID", () => {
+    expect(() => parseReplayArguments(["test-org/cli"])).toThrow(ContextError);
+    expect(() => parseReplayArguments(["test-org/cli/"])).toThrow(ContextError);
+  });
+
+  test("throws ValidationError for an invalid replay ID", () => {
+    expect(() => parseReplayArguments(["not-hex"])).toThrow(ValidationError);
+    expect(() => parseReplayArguments(["test-org/cli", "not-hex"])).toThrow(
+      ValidationError,
+    );
+  });
+
+  test("ignores extra positional args with a warning", () => {
+    expect(
+      parseReplayArguments(["test-org/cli", REPLAY_ID, "extra-arg"]),
+    ).toMatchObject({
+      replayId: REPLAY_ID,
+      target: { type: "explicit", org: "test-org", project: "cli" },
+      warnings: [expect.stringContaining("Extra arguments ignored: extra-arg")],
+    });
+  });
+});
+
+describe("viewCommand.func", () => {
+  let getProjectSpy: ReturnType<typeof spyOn>;
+  let resolveReplaySpy: ReturnType<typeof spyOn>;
+  let getReplayRecordingSegmentsSpy: ReturnType<typeof spyOn>;
+  let getTraceMetaSpy: ReturnType<typeof spyOn>;
+  let listIssuesPaginatedSpy: ReturnType<typeof spyOn>;
+  let resolveTargetSpy: ReturnType<typeof spyOn>;
+  let openInBrowserSpy: ReturnType<typeof spyOn>;
+
+  function createMockContext() {
+    const stdoutWrite = vi.fn(() => true);
+    return {
+      context: {
+        stdout: { write: stdoutWrite },
+        stderr: { write: vi.fn(() => true) },
+        cwd: "/tmp",
+      },
+      stdoutWrite,
+    };
+  }
+
+  beforeEach(() => {
+    getProjectSpy = vi.spyOn(apiClient, "getProject").mockResolvedValue({
+      id: "42",
+      slug: "cli",
+      name: "CLI",
+    });
+    resolveReplaySpy = vi.spyOn(apiClient, "resolveReplay");
+    getReplayRecordingSegmentsSpy = vi
+      .spyOn(apiClient, "getReplayRecordingSegments")
+      .mockResolvedValue([
+        [
+          {
+            timestamp: 1_735_500_000_000,
+            data: { href: "/checkout" },
+          },
+        ],
+      ]);
+    getTraceMetaSpy = vi.spyOn(apiClient, "getTraceMeta").mockResolvedValue({
+      errorsCount: 2,
+      logsCount: 4,
+      metricsCount: 0,
+      performanceIssuesCount: 1,
+      spansCount: 8,
+      spansCountMap: {},
+      transactionChildCountMap: [],
+    });
+    listIssuesPaginatedSpy = vi
+      .spyOn(apiClient, "listIssuesPaginated")
+      .mockResolvedValue({
+        data: [
+          {
+            id: "100",
+            shortId: "CLI-123",
+            title: "Checkout error",
+          },
+        ],
+      });
+    resolveTargetSpy = vi.spyOn(resolveTarget, "resolveOrgOptionalTarget");
+    openInBrowserSpy = vi.spyOn(browser, "openInBrowser").mockResolvedValue();
+  });
+
+  afterEach(() => {
+    getProjectSpy.mockRestore();
+    resolveReplaySpy.mockRestore();
+    getReplayRecordingSegmentsSpy.mockRestore();
+    getTraceMetaSpy.mockRestore();
+    listIssuesPaginatedSpy.mockRestore();
+    resolveTargetSpy.mockRestore();
+    openInBrowserSpy.mockRestore();
+  });
+
+  test("renders JSON output", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(
+      sampleReplay({
+        error_ids: ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      }),
+    );
+
+    const { context, stdoutWrite } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: true, web: false, fresh: false },
+      REPLAY_ID,
+    );
+
+    const output = stdoutWrite.mock.calls.map((call) => call[0]).join("");
+    const parsed = JSON.parse(output);
+    expect(parsed.id).toBe(REPLAY_ID);
+    expect(parsed.org).toBe("test-org");
+    expect(parsed.activity[0]?.label).toBe("page.view");
+    expect(parsed.relatedIssues[0]?.shortId).toBe("CLI-123");
+    expect(parsed.relatedTraces[0]?.spanCount).toBe(8);
+    expect(parsed.trace_ids[0]).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(getReplayRecordingSegmentsSpy).toHaveBeenCalledWith(
+      "test-org",
+      "42",
+      REPLAY_ID,
+      { expectedSegments: 5 },
+    );
+    expect(listIssuesPaginatedSpy).toHaveBeenCalledWith(
+      "test-org",
+      "",
+      expect.objectContaining({
+        perPage: 1,
+        query: "event.id:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    );
+  });
+
+  test("opens the replay in the browser with --web", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(sampleReplay());
+
+    const { context } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: false, web: true, fresh: false },
+      `test-org/${REPLAY_ID}`,
+    );
+
+    expect(openInBrowserSpy).toHaveBeenCalledWith(
+      "https://test-org.sentry.io/explore/replays/346789a703f6454384f1de473b8b9fcc/",
+      "replay",
+    );
+  });
+
+  test("opens the replay URL target from a replay URL with --web", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: undefined });
+    resolveReplaySpy.mockResolvedValue(sampleReplay());
+
+    const { context } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: false, web: true, fresh: false },
+      `https://sentry.io/organizations/test-org/explore/replays/${REPLAY_ID}/`,
+    );
+
+    expect(openInBrowserSpy).toHaveBeenCalledWith(
+      "https://test-org.sentry.io/explore/replays/346789a703f6454384f1de473b8b9fcc/",
+      "replay",
+    );
+  });
+
+  test("opens the linked replay id in the browser when given a trace id", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(sampleReplay());
+
+    const { context } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: false, web: true, fresh: false },
+      TRACE_ID,
+    );
+
+    expect(openInBrowserSpy).toHaveBeenCalledWith(
+      "https://test-org.sentry.io/explore/replays/346789a703f6454384f1de473b8b9fcc/",
+      "replay",
+    );
+  });
+
+  test("converts missing replays into ResolutionError", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockRejectedValue(
+      new ApiError("Failed to get replay", 404, "Not Found"),
+    );
+
+    const { context } = createMockContext();
+    const func = await viewCommand.loader();
+
+    await expect(
+      func.call(context, { json: false, web: false, fresh: false }, REPLAY_ID),
+    ).rejects.toThrow(ResolutionError);
+  });
+
+  test("rejects replays outside the explicit project scope", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(sampleReplay({ project_id: "999" }));
+
+    const { context } = createMockContext();
+    const func = await viewCommand.loader();
+
+    await expect(
+      func.call(context, { json: false, web: false, fresh: false }, REPLAY_ID),
+    ).rejects.toThrow(ResolutionError);
+  });
+
+  test("allows archived replays with no project ID in explicit project scope", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(
+      sampleReplay({
+        count_segments: 0,
+        is_archived: true,
+        project_id: null,
+      }),
+    );
+
+    const { context, stdoutWrite } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: true, web: false, fresh: false },
+      REPLAY_ID,
+    );
+
+    expect(getProjectSpy).not.toHaveBeenCalled();
+    const output = stdoutWrite.mock.calls.map((call) => call[0]).join("");
+    const parsed = JSON.parse(output);
+    expect(parsed.is_archived).toBe(true);
+  });
+
+  test("renders activity and related sections in human output", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(
+      sampleReplay({
+        error_ids: ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        urls: ["/checkout"],
+      }),
+    );
+
+    const { context, stdoutWrite } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: false, web: false, fresh: false },
+      REPLAY_ID,
+    );
+
+    const output = stdoutWrite.mock.calls.map((call) => call[0]).join("");
+    expect(output).toContain("Activity");
+    expect(output).toContain("page.view");
+    expect(output).toContain("Related");
+    expect(output).toContain("CLI-123");
+    expect(output).toContain("sentry trace view test-org/");
+  });
+
+  test("anchors activity offsets to the replay start time", async () => {
+    resolveTargetSpy.mockResolvedValue({ org: "test-org", project: "cli" });
+    resolveReplaySpy.mockResolvedValue(
+      sampleReplay({
+        started_at: "2025-01-01T00:00:00.000Z",
+      }),
+    );
+    getReplayRecordingSegmentsSpy.mockResolvedValue([
+      [
+        {
+          timestamp: Date.parse("2025-01-01T00:00:05.000Z"),
+          data: { href: "/checkout" },
+        },
+      ],
+    ]);
+
+    const { context, stdoutWrite } = createMockContext();
+    const func = await viewCommand.loader();
+    await func.call(
+      context,
+      { json: false, web: false, fresh: false },
+      REPLAY_ID,
+    );
+
+    const output = stdoutWrite.mock.calls.map((call) => call[0]).join("");
+    expect(output).toContain("5s");
+  });
+});
+
+describe("replayArguments", () => {
+  const positional = replayArguments("view", () => "sentry replay view <id>");
+  const context = { cwd: "/tmp" };
+  const parse = (raw: string[]) =>
+    applyBoundPositionals(raw, positional, context)[0] as ReplayArguments;
+
+  test("parses the replay ID and target without resolving", () => {
+    const target = parse(["test-org/cli", REPLAY_ID]);
+    expect(target.parsed).toEqual({
+      replayId: REPLAY_ID,
+      target: { type: "explicit", org: "test-org", project: "cli" },
+      baseUrl: undefined,
+      warnings: [],
+    });
+  });
+
+  test("rejects an invalid replay ID when parsing", () => {
+    let error: unknown;
+    try {
+      parse(["not-hex"]);
+    } catch (caught) {
+      error = caught;
+    }
+    expect((error as ArgumentParseError).exception).toBeInstanceOf(
+      ValidationError,
+    );
+  });
+
+  test("applies a pasted URL's server when resolving, not when parsing", async () => {
+    const target = parse([
+      `https://sentry.example.com/organizations/acme/explore/replays/${REPLAY_ID}/`,
+    ]);
+    expect(target.parsed.baseUrl).toBe("https://sentry.example.com");
+    // No account for this server: applying it throws HostScopeError
+    await expect(target.resolved).rejects.toThrow(HostScopeError);
+  });
+});

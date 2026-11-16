@@ -38,6 +38,7 @@
  * }
  * ```
  */
+import type { UpdateOrganizationIssueData } from "@sentry/api";
 import type { z } from "zod";
 import type {
   AgenticOnboardingRunSchema,
@@ -54,10 +55,13 @@ import type {
   AssignedToSchema,
   AutofixRunSchema,
   AutofixRunStateSchema,
+  SearchAgentStartSchema,
+  SearchAgentStateSchema,
   ClientKeyListSchema,
   ClientKeySchema,
   CommitListSchema,
   CommitSchema,
+  CommittersResponseSchema,
   DashboardListItemSchema,
   DashboardSchema,
   DashboardWidgetSchema,
@@ -83,8 +87,11 @@ import type {
   IssueAlertRuleSchema,
   IssueCommentListSchema,
   IssueCommentSchema,
+  IssueIntegrationListSchema,
+  IssueIntegrationSchema,
   IssueListSchema,
   IssueSchema,
+  IssueTagKeyListSchema,
   IssueTagValuesSchema,
   MetricAlertRuleListSchema,
   MetricAlertRuleSchema,
@@ -94,6 +101,7 @@ import type {
   MonitorSchema,
   MonitorStatSchema,
   MonitorStatsSchema,
+  NativeExternalIssueSchema,
   OrganizationEnvironmentListSchema,
   OrganizationListSchema,
   OrganizationSchema,
@@ -109,8 +117,10 @@ import type {
   ReleaseSchema,
   ReplayDetailsSchema,
   ReplayListResponseSchema,
-  ReplayRecordingEventSchema,
-  ReplayRecordingSegmentsSchema,
+  SentryAppComponentListSchema,
+  SentryAppExternalRequestOptionsSchema,
+  SentryAppInstallationListSchema,
+  SourceMapDebugSchema,
   StacktraceLinkSchema,
   TagListSchema,
   TagSchema,
@@ -123,6 +133,7 @@ import type {
   TransactionEventSchema,
   TransactionProfileSampleSchema,
   TransactionProfileSchema,
+  LegacySpeedscopeProfileSchema,
   UnknownEventSchema,
   UptimeCheckListSchema,
   UptimeCheckSchema,
@@ -205,6 +216,19 @@ export type Commit = z.infer<typeof CommitSchema>;
 export type Issue = z.infer<typeof IssueSchema>;
 export type IssueActivity = z.infer<typeof IssueActivitySchema>;
 export type IssueComment = z.infer<typeof IssueCommentSchema>;
+
+type IssueUpdateStatusDetails = NonNullable<
+  NonNullable<UpdateOrganizationIssueData["body"]>["statusDetails"]
+>;
+
+/**
+ * `statusDetails` that resolve an issue in a specific release or commit,
+ * narrowed from the `@sentry/api` issue update body. Sentry validates both
+ * against its own release and commit records.
+ */
+export type IssueResolutionDetails =
+  | Required<Pick<IssueUpdateStatusDetails, "inRelease">>
+  | Required<Pick<IssueUpdateStatusDetails, "inCommit">>;
 export type Monitor = z.infer<typeof MonitorSchema>;
 export type MonitorCheckIn = z.infer<typeof MonitorCheckInSchema>;
 export type MonitorStat = z.infer<typeof MonitorStatSchema>;
@@ -227,18 +251,17 @@ export type Event =
   | GenericEvent
   | UnknownEvent;
 export type StacktraceLink = z.infer<typeof StacktraceLinkSchema>;
+export type SourceMapDebug = z.infer<typeof SourceMapDebugSchema>;
 
 export type EventAttachment = z.infer<typeof EventAttachmentSchema>;
 export type Tag = z.infer<typeof TagSchema>;
 export type AutofixRun = z.infer<typeof AutofixRunSchema>;
 export type AutofixRunState = z.infer<typeof AutofixRunStateSchema>;
+export type SearchAgentStart = z.infer<typeof SearchAgentStartSchema>;
+export type SearchAgentState = z.infer<typeof SearchAgentStateSchema>;
 export type AssignedTo = z.infer<typeof AssignedToSchema>;
 export type ReplayDetails = z.infer<typeof ReplayDetailsSchema>;
 export type ReplayList = z.infer<typeof ReplayListResponseSchema>["data"];
-export type ReplayRecordingEvent = z.infer<typeof ReplayRecordingEventSchema>;
-export type ReplayRecordingSegments = z.infer<
-  typeof ReplayRecordingSegmentsSchema
->;
 
 export type OrganizationList = z.infer<typeof OrganizationListSchema>;
 export type TeamList = z.infer<typeof TeamListSchema>;
@@ -248,6 +271,9 @@ export type MetricAlertRuleList = z.infer<typeof MetricAlertRuleListSchema>;
 export type ReleaseList = z.infer<typeof ReleaseListSchema>;
 export type DeployList = z.infer<typeof DeployListSchema>;
 export type CommitList = z.infer<typeof CommitListSchema>;
+export type CommitterList = z.infer<
+  typeof CommittersResponseSchema
+>["committers"];
 export type IssueList = z.infer<typeof IssueListSchema>;
 export type IssueActivityList = z.infer<
   typeof IssueActivityListResponseSchema
@@ -300,6 +326,15 @@ export type ProfileChunk = z.infer<typeof ProfileChunkSchema>;
 export type ProfileChunkResponse = z.infer<typeof ProfileChunkResponseSchema>;
 export type ProfileChunkSample = z.infer<typeof ProfileChunkSampleSchema>;
 export type TransactionProfile = z.infer<typeof TransactionProfileSchema>;
+export type LegacySpeedscopeProfile = z.infer<
+  typeof LegacySpeedscopeProfileSchema
+>;
+
+export function isLegacySpeedscopeProfile(
+  profile: TransactionProfile | LegacySpeedscopeProfile,
+): profile is LegacySpeedscopeProfile {
+  return profile.format === "speedscope";
+}
 export type TransactionProfileSample = z.infer<
   typeof TransactionProfileSampleSchema
 >;
@@ -307,10 +342,23 @@ export type ProfileFrame = z.infer<typeof ProfileFrameSchema>;
 
 // Issue tag values
 export type IssueTagValues = z.infer<typeof IssueTagValuesSchema>;
+export type IssueTagKeyList = z.infer<typeof IssueTagKeyListSchema>;
 
 // External issue links (Jira, GitHub, etc.)
 export type ExternalIssue = z.infer<typeof ExternalIssueSchema>;
 export type ExternalIssueList = z.infer<typeof ExternalIssueListSchema>;
+export type IssueIntegration = z.infer<typeof IssueIntegrationSchema>;
+export type IssueIntegrationList = z.infer<typeof IssueIntegrationListSchema>;
+export type NativeExternalIssue = z.infer<typeof NativeExternalIssueSchema>;
+export type SentryAppInstallationList = z.infer<
+  typeof SentryAppInstallationListSchema
+>;
+export type SentryAppComponentList = z.infer<
+  typeof SentryAppComponentListSchema
+>;
+export type SentryAppExternalRequestOptions = z.infer<
+  typeof SentryAppExternalRequestOptionsSchema
+>;
 
 // User Report
 export type UserReportList = z.infer<typeof UserReportListSchema>;

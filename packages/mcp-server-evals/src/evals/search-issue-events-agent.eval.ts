@@ -1,5 +1,5 @@
-import { describeEval } from "vitest-evals";
-import { ToolCallScorer } from "vitest-evals";
+import { describeEval } from "vitest-evals/legacy";
+import { ToolCallScorer } from "vitest-evals/legacy";
 import { searchIssueEventsAgent } from "@sentry/mcp-core/tools/search-issue-events/agent";
 import { SentryApiService } from "@sentry/mcp-core/api-client";
 import { StructuredOutputScorer } from "./utils/structuredOutputScorer";
@@ -73,7 +73,7 @@ describeEval("search-issue-events-agent", {
       },
       {
         // Combined filters with time range
-        input: "Production events from yesterday with specific release",
+        input: "Production events from yesterday with the 5.1 release",
         expectedTools: [],
         expected: {
           query:

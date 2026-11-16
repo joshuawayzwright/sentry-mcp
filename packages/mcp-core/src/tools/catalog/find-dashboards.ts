@@ -1,13 +1,12 @@
 import { z } from "zod";
-import { setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
 import type { DashboardListItem, SentryApiService } from "../../api-client";
 import { UserInputError } from "../../errors";
-import { defineTool } from "../../internal/tool-helpers/define";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
+import { defineTool } from "../../internal/tool-helpers/define";
 import { structuredResult } from "../../internal/tool-helpers/results";
-import type { ServerContext } from "../../types";
 import { ParamOrganizationSlug, ParamRegionUrl } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
+import type { ServerContext } from "../../types";
 import {
   filterDashboardsByProjectConstraint,
   resolveDashboardProjectConstraint,
@@ -224,6 +223,7 @@ async function listProjectVisibleDashboards({
 
 export default defineTool({
   name: "find_dashboards",
+  title: "Find Dashboards",
   skills: ["inspect"],
   requiredScopes: ["org:read"],
   description: [
@@ -285,7 +285,7 @@ export default defineTool({
     });
     const organizationSlug = params.organizationSlug;
 
-    setOrganizationContext(organizationSlug);
+    setTargetTagsAndAttributes({ organizationSlug });
 
     const scopedProject = await resolveDashboardProjectConstraint({
       apiService,
@@ -293,8 +293,11 @@ export default defineTool({
       scopedProjectSlug: context.constraints.projectSlug,
     });
     if (scopedProject) {
-      setTag("project.slug", scopedProject.slug);
-      setTag("project.id", String(scopedProject.id));
+      setTargetTagsAndAttributes({
+        organizationSlug,
+        projectSlug: scopedProject.slug,
+        projectId: scopedProject.id,
+      });
     }
 
     let dashboards: DashboardListItem[];
@@ -325,7 +328,9 @@ export default defineTool({
         id: String(dashboard.id),
         title: dashboard.title,
         widgetCount: dashboard.widgetPreview.length,
-        widgetTypes: Array.from(new Set(dashboard.widgetDisplay)),
+        widgetTypes: [
+          ...new Set(dashboard.widgetDisplay.filter((type) => type !== null)),
+        ],
         projects: dashboard.projects.map(String),
         environments: dashboard.environment,
         createdBy: dashboard.createdBy

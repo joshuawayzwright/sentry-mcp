@@ -1,19 +1,25 @@
 import { z } from "zod";
-import { setTag } from "@sentry/core";
-import { setOrganizationContext } from "../../telem/organization";
-import { defineTool } from "../../internal/tool-helpers/define";
 import { apiServiceFromContext } from "../../internal/tool-helpers/api";
-import type { ServerContext } from "../../types";
+import { defineTool } from "../../internal/tool-helpers/define";
+import { structuredResult } from "../../internal/tool-helpers/results";
 import { ParamOrganizationSlug, ParamRegionUrl } from "../../schema";
+import { setTargetTagsAndAttributes } from "../../telem/scope";
+import type { ServerContext } from "../../types";
 import {
   assertDashboardWithinProjectConstraint,
-  formatDashboardDetails,
-  resolveDashboardProjectConstraint,
+  dashboardDetailsSchema,
   resolveDashboardId,
+  resolveDashboardProjectConstraint,
+  toDashboardDetails,
 } from "../support/dashboards";
+
+export const getDashboardDetailsOutputSchema = z.object({
+  dashboard: dashboardDetailsSchema,
+});
 
 export default defineTool({
   name: "get_dashboard_details",
+  title: "Get Dashboard Details",
   skills: ["inspect"],
   requiredScopes: ["org:read"],
   description: [
@@ -33,6 +39,7 @@ export default defineTool({
     "- Numeric dashboard IDs are resolved directly.",
     "- Title lookups require one exact case-insensitive match. Use `find_dashboards` first if uncertain.",
     "- This returns saved widget query definitions, not live widget data.",
+    "- Saved transformations are listed per aggregate position, in application order.",
     "</hints>",
   ].join("\n"),
   inputSchema: {
@@ -44,6 +51,7 @@ export default defineTool({
       .min(1)
       .describe("The dashboard's numeric ID or exact title."),
   },
+  outputSchema: getDashboardDetailsOutputSchema,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -55,7 +63,7 @@ export default defineTool({
     });
     const organizationSlug = params.organizationSlug;
 
-    setOrganizationContext(organizationSlug);
+    setTargetTagsAndAttributes({ organizationSlug });
 
     const scopedProject = await resolveDashboardProjectConstraint({
       apiService,
@@ -63,8 +71,11 @@ export default defineTool({
       scopedProjectSlug: context.constraints.projectSlug,
     });
     if (scopedProject) {
-      setTag("project.slug", scopedProject.slug);
-      setTag("project.id", String(scopedProject.id));
+      setTargetTagsAndAttributes({
+        organizationSlug,
+        projectSlug: scopedProject.slug,
+        projectId: scopedProject.id,
+      });
     }
 
     const dashboardId = await resolveDashboardId({
@@ -85,19 +96,20 @@ export default defineTool({
       projectId: scopedProject?.id,
     });
 
-    return formatDashboardDetails({
-      dashboard,
-      organizationSlug,
-      dashboardUrl: apiService.getDashboardUrl(
-        organizationSlug,
-        String(dashboard.id),
-        {
-          projectId:
-            scopedProject?.id ??
-            (dashboard.projects.length === 1 ? dashboard.projects[0] : null),
-          statsPeriod: dashboard.period ?? null,
-        },
-      ),
+    return structuredResult({
+      dashboard: toDashboardDetails({
+        dashboard,
+        dashboardUrl: apiService.getDashboardUrl(
+          organizationSlug,
+          String(dashboard.id),
+          {
+            projectId:
+              scopedProject?.id ??
+              (dashboard.projects.length === 1 ? dashboard.projects[0] : null),
+            statsPeriod: dashboard.period ?? null,
+          },
+        ),
+      }),
     });
   },
 });

@@ -1,0 +1,333 @@
+/**
+ * Seer Trial Prompt Tests
+ *
+ * Tests for the interactive trial prompt flow. `isatty` is mocked so the
+ * isTrialEligible tests can simulate an interactive terminal.
+ */
+
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+vi.mock("../../src/lib/prompt.js", () => ({ prompt: vi.fn() }));
+vi.mock("node:tty", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:tty")>()),
+  isatty: vi.fn(() => false),
+}));
+
+import { isatty } from "node:tty";
+
+// oxlint-disable-next-line sentry-cli/no-namespace-import -- needed for spyOn mocking
+import * as apiClient from "../../src/lib/api-client.js";
+import { SeerError } from "../../src/lib/errors.js";
+// oxlint-disable-next-line sentry-cli/no-namespace-import -- needed for spyOn mocking
+import * as loggerModule from "../../src/lib/logger.js";
+import { prompt } from "../../src/lib/prompt.js";
+import {
+  isTrialEligible,
+  promptAndStartTrial,
+} from "../../src/lib/seer-trial.js";
+
+describe("isTrialEligible", () => {
+  // Simulate an interactive terminal, so a false result comes from the error
+  // itself and not from the terminal check.
+  beforeEach(() => {
+    vi.mocked(isatty).mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    vi.mocked(isatty).mockReturnValue(false);
+  });
+
+  test.each(["no_budget", "not_enabled"] as const)(
+    "returns true for %s reason in an interactive terminal",
+    (reason) => {
+      expect(isTrialEligible(new SeerError(reason, "test-org"))).toBe(true);
+    },
+  );
+
+  test("returns false outside an interactive terminal", () => {
+    vi.mocked(isatty).mockReturnValue(false);
+    expect(isTrialEligible(new SeerError("no_budget", "test-org"))).toBe(false);
+  });
+
+  test("returns false for ai_disabled reason", () => {
+    const err = new SeerError("ai_disabled", "test-org");
+    expect(isTrialEligible(err)).toBe(false);
+  });
+
+  test("returns false for out_of_credits reason", () => {
+    const err = new SeerError("out_of_credits", "test-org");
+    expect(isTrialEligible(err)).toBe(false);
+  });
+
+  test("returns false when orgSlug is undefined", () => {
+    const err = new SeerError("no_budget");
+    expect(isTrialEligible(err)).toBe(false);
+  });
+
+  test("returns false when orgSlug is undefined for not_enabled", () => {
+    const err = new SeerError("not_enabled");
+    expect(isTrialEligible(err)).toBe(false);
+  });
+
+  test("returns false for non-SeerError", () => {
+    expect(isTrialEligible(new Error("random error"))).toBe(false);
+  });
+
+  test("returns false for null", () => {
+    expect(isTrialEligible(null)).toBe(false);
+  });
+
+  test("returns false for string", () => {
+    expect(isTrialEligible("some error string")).toBe(false);
+  });
+});
+
+describe("promptAndStartTrial", () => {
+  let getProductTrialsSpy: ReturnType<typeof spyOn>;
+  let startProductTrialSpy: ReturnType<typeof spyOn>;
+  let promptSpy: ReturnType<typeof vi.fn>;
+  let loggerWithTagSpy: ReturnType<typeof spyOn>;
+  let logDebugCalls: string[];
+  let logInfoCalls: string[];
+  let logWarnCalls: string[];
+  let logSuccessCalls: string[];
+
+  const MOCK_SEER_TRIAL = {
+    category: "seerUsers",
+    startDate: null,
+    endDate: null,
+    reasonCode: 0,
+    isStarted: false,
+    lengthDays: 14,
+  };
+
+  beforeEach(() => {
+    logDebugCalls = [];
+    logInfoCalls = [];
+    logWarnCalls = [];
+    logSuccessCalls = [];
+
+    getProductTrialsSpy = vi
+      .spyOn(apiClient, "getProductTrials")
+      .mockResolvedValue([]);
+    startProductTrialSpy = vi
+      .spyOn(apiClient, "startProductTrial")
+      .mockResolvedValue(undefined);
+
+    // Mock the logger's withTag to return an object with all needed methods
+    promptSpy = vi.mocked(prompt);
+    promptSpy.mockReset();
+    promptSpy.mockResolvedValue(false);
+    const mockLogInstance = {
+      debug: (...args: unknown[]) => {
+        logDebugCalls.push(args.map(String).join(" "));
+      },
+      info: (...args: unknown[]) => {
+        logInfoCalls.push(args.map(String).join(" "));
+      },
+      warn: (...args: unknown[]) => {
+        logWarnCalls.push(args.map(String).join(" "));
+      },
+      success: (...args: unknown[]) => {
+        logSuccessCalls.push(args.map(String).join(" "));
+      },
+    };
+    loggerWithTagSpy = vi
+      .spyOn(loggerModule.logger, "withTag")
+      .mockReturnValue(
+        mockLogInstance as ReturnType<typeof loggerModule.logger.withTag>,
+      );
+  });
+
+  afterEach(() => {
+    getProductTrialsSpy.mockRestore();
+    startProductTrialSpy.mockRestore();
+    loggerWithTagSpy.mockRestore();
+  });
+
+  test("returns false when no trial is available and shows expired message", async () => {
+    getProductTrialsSpy.mockResolvedValue([]);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(getProductTrialsSpy).toHaveBeenCalledWith("test-org");
+    // Should not prompt if no trial available
+    expect(promptSpy).not.toHaveBeenCalled();
+    // Should show expired/upgrade message
+    expect(
+      logInfoCalls.some((m) => m.includes("No Seer trial available")),
+    ).toBe(true);
+    expect(logInfoCalls.some((m) => m.includes("upgrading your plan"))).toBe(
+      true,
+    );
+  });
+
+  test("returns false when only non-seer trials exist", async () => {
+    getProductTrialsSpy.mockResolvedValue([
+      { ...MOCK_SEER_TRIAL, category: "replays" },
+    ]);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(promptSpy).not.toHaveBeenCalled();
+  });
+
+  test("returns false when seer trial is already started", async () => {
+    getProductTrialsSpy.mockResolvedValue([
+      { ...MOCK_SEER_TRIAL, isStarted: true },
+    ]);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(promptSpy).not.toHaveBeenCalled();
+  });
+
+  test("returns false when trial check throws (graceful degradation)", async () => {
+    getProductTrialsSpy.mockRejectedValue(new Error("Network error"));
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(promptSpy).not.toHaveBeenCalled();
+  });
+
+  test("returns false when user declines the prompt", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    promptSpy.mockResolvedValue(false);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(logInfoCalls.some((m) => m.includes("run out of Seer quota"))).toBe(
+      true,
+    );
+    expect(startProductTrialSpy).not.toHaveBeenCalled();
+  });
+
+  test("returns false when user cancels with Ctrl+C (Symbol)", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    // The prompt returns Symbol(clack:cancel) on Ctrl+C
+    promptSpy.mockResolvedValue(Symbol("clack:cancel"));
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(startProductTrialSpy).not.toHaveBeenCalled();
+  });
+
+  test("starts trial and returns true on confirmation", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    promptSpy.mockResolvedValue(true);
+    startProductTrialSpy.mockResolvedValue(undefined);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(true);
+    expect(startProductTrialSpy).toHaveBeenCalledWith("test-org", "seerUsers");
+    expect(logInfoCalls.some((m) => m.includes("Starting Seer trial"))).toBe(
+      true,
+    );
+    expect(
+      logSuccessCalls.some((m) => m.includes("Seer trial activated")),
+    ).toBe(true);
+  });
+
+  test("prefers seerUsers over seerAutofix", async () => {
+    getProductTrialsSpy.mockResolvedValue([
+      { ...MOCK_SEER_TRIAL, category: "seerAutofix" },
+      MOCK_SEER_TRIAL,
+    ]);
+    promptSpy.mockResolvedValue(true);
+    startProductTrialSpy.mockResolvedValue(undefined);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(true);
+    expect(startProductTrialSpy).toHaveBeenCalledWith("test-org", "seerUsers");
+  });
+
+  test("falls back to seerAutofix when seerUsers is not available", async () => {
+    getProductTrialsSpy.mockResolvedValue([
+      { ...MOCK_SEER_TRIAL, category: "seerAutofix" },
+    ]);
+    promptSpy.mockResolvedValue(true);
+    startProductTrialSpy.mockResolvedValue(undefined);
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(true);
+    expect(startProductTrialSpy).toHaveBeenCalledWith(
+      "test-org",
+      "seerAutofix",
+    );
+  });
+
+  test("returns false when trial start fails and shows settings link", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    promptSpy.mockResolvedValue(true);
+    startProductTrialSpy.mockRejectedValue(new Error("API error"));
+
+    const result = await promptAndStartTrial("test-org", "no_budget");
+
+    expect(result).toBe(false);
+    expect(logWarnCalls.some((m) => m.includes("Failed to start trial"))).toBe(
+      true,
+    );
+    // Should include a link to billing/settings
+    expect(
+      logWarnCalls.some((m) => m.includes("settings/billing/overview")),
+    ).toBe(true);
+    // Should mention support contact
+    expect(logWarnCalls.some((m) => m.includes("support@sentry"))).toBe(true);
+  });
+
+  test("shows correct context message for not_enabled reason", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    promptSpy.mockResolvedValue(false);
+
+    await promptAndStartTrial("test-org", "not_enabled");
+
+    expect(
+      logInfoCalls.some((m) => m.includes("not enabled for your organization")),
+    ).toBe(true);
+  });
+
+  test("shows correct context message for no_budget reason", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    promptSpy.mockResolvedValue(false);
+
+    await promptAndStartTrial("test-org", "no_budget");
+
+    expect(logInfoCalls.some((m) => m.includes("run out of Seer quota"))).toBe(
+      true,
+    );
+  });
+
+  test("includes trial length in prompt message", async () => {
+    getProductTrialsSpy.mockResolvedValue([MOCK_SEER_TRIAL]);
+    promptSpy.mockResolvedValue(false);
+
+    await promptAndStartTrial("test-org", "no_budget");
+
+    expect(promptSpy).toHaveBeenCalled();
+    const promptMessage = promptSpy.mock.calls[0]?.[0] as string;
+    expect(promptMessage).toContain("14-day");
+  });
+
+  test("omits trial length when null", async () => {
+    getProductTrialsSpy.mockResolvedValue([
+      { ...MOCK_SEER_TRIAL, lengthDays: null },
+    ]);
+    promptSpy.mockResolvedValue(false);
+
+    await promptAndStartTrial("test-org", "no_budget");
+
+    expect(promptSpy).toHaveBeenCalled();
+    const promptMessage = promptSpy.mock.calls[0]?.[0] as string;
+    expect(promptMessage).not.toContain("day");
+    expect(promptMessage).toContain("free Seer trial");
+  });
+});

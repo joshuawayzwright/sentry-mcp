@@ -5,6 +5,7 @@ Cloudflare Workers deployment configuration and release process.
 ## Architecture Overview
 
 The deployment consists of:
+
 - **Worker**: Stateless HTTP server with OAuth flow and MCP handler
 - **KV Storage**: OAuth token storage
 - **Static Assets**: React UI for setup instructions
@@ -20,26 +21,29 @@ The deployment consists of:
   "compatibility_date": "2025-03-21",
   "compatibility_flags": [
     "nodejs_compat",
-    "nodejs_compat_populate_process_env"
+    "nodejs_compat_populate_process_env",
   ],
   "keep_vars": true,
 
   // Bindings
-  "kv_namespaces": [{
-    "binding": "OAUTH_KV",
-    "id": "your-kv-namespace-id"
-  }],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "your-kv-namespace-id",
+    },
+  ],
 
   // SPA configuration
   "site": {
-    "bucket": "./dist/client"
-  }
+    "bucket": "./dist/client",
+  },
 }
 ```
 
 ### Environment Variables
 
 Required in production:
+
 ```bash
 SENTRY_CLIENT_ID=your_oauth_app_id
 SENTRY_CLIENT_SECRET=your_oauth_app_secret
@@ -47,6 +51,7 @@ COOKIE_SECRET=32_char_random_string
 ```
 
 Optional overrides for self-hosted deployments:
+
 ```bash
 # Leave unset to target the SaaS host
 SENTRY_HOST=sentry.example.com     # Hostname only (self-hosted only)
@@ -57,6 +62,7 @@ self-hosted Sentry instance; no additional host variables are required for the
 SaaS service.
 
 Development (.dev.vars):
+
 ```bash
 SENTRY_CLIENT_ID=dev_client_id
 SENTRY_CLIENT_SECRET=dev_secret
@@ -69,10 +75,14 @@ The MCP handler uses a stateless architecture with closure-captured context:
 
 ```typescript
 import { experimental_createMcpHandler as createMcpHandler } from "agents/mcp";
-import { buildServer } from "@sentry/mcp-server/server";
+import { buildServer } from "@sentry/mcp-core/server";
 
 const mcpHandler: ExportedHandler<Env> = {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     // Extract auth props from ExecutionContext (set by OAuth provider)
     const oauthCtx = ctx as OAuthExecutionContext;
 
@@ -81,7 +91,7 @@ const mcpHandler: ExportedHandler<Env> = {
       userId: oauthCtx.props.userId,
       clientId: oauthCtx.props.clientId,
       accessToken: oauthCtx.props.accessToken,
-      grantedSkills,  // Primary authorization method
+      grantedSkills, // Primary authorization method
       constraints: verification.constraints,
       sentryHost,
       mcpUrl: oauthCtx.props.mcpUrl,
@@ -136,32 +146,50 @@ pnpm dev
 
 ### Production Deployment
 
-#### Automated via GitHub Actions (Recommended)
+#### Automated via GitHub Actions
 
-Production deployments happen automatically when changes are pushed to the main branch:
+Production deployments run only from the trusted `Deploy to Cloudflare` workflow
+after the `Test` workflow succeeds for the current `main` commit:
 
-1. Push to main or merge a PR
-2. GitHub Actions runs tests
-3. If tests pass, deploys to Cloudflare
+1. Merge a PR into `main`; GitHub Actions tests that exact commit.
+2. The workflow builds once, captures the live production version, and uploads
+   the generated Worker bundle and `dist/client` SPA assets without shifting
+   traffic. The source `public` directory does not contain the built homepage.
+3. It stages that version at 0% while the prior version serves 100%, then tests
+   it with a version override through the production route. The version probe
+   confirms that the candidate handled the overridden request.
+4. It promotes the tested version to 100% and checks both ownership and live
+   smoke tests. If a step fails, it restores the captured prior version only
+   while the latest Cloudflare deployment is still owned by that run. External
+   changes or ambiguous traffic stop recovery.
 
-Required secrets in GitHub repository settings:
-- `CLOUDFLARE_API_TOKEN` - API token with Workers deployment permissions
-- `CLOUDFLARE_ACCOUNT_ID` - Your Cloudflare account ID
+The `production` GitHub environment allows only `main`. Store
+`CLOUDFLARE_API_TOKEN` there with Workers deployment permissions. Configure
+`CLOUDFLARE_ACCOUNT_ID` for the account that owns both Workers. Keep credentials
+out of command arguments and logs. After a verified deployment, remove any
+repository-level copy of `CLOUDFLARE_API_TOKEN`.
+
+The workspace catalog pins Wrangler to 4.151.3 for MCP and CLI docs. Cloudflare
+plugins retain their own transitive Wrangler versions. Since 4.136.1, Wrangler reads
+`workers.dev` and version-preview URLs from the Worker resource. Older versions
+can upload successfully with a Worker-scoped token, then fail while reading the
+account-level subdomain. This upgrade requires Node 22 or newer. When changing
+the pin, run the local smoke workflow as well as the build: Wrangler 4.125.0
+previously caused the local Worker to exit during OAuth metadata requests.
+
+`upload_source_maps` stays explicitly disabled for Cloudflare uploads; the Vite
+plugin uploads source maps to Sentry. Wrangler 4.150.0 changed its default to
+upload source maps when this setting is omitted.
 
 See `github-actions.md` for detailed setup instructions.
 
-#### Manual Deployment
-
-```bash
-# Build client assets
-pnpm build
-
-# Deploy to Cloudflare
-pnpm deploy
-
-# Or deploy specific environment
-pnpm deploy --env production
-```
+Manual recovery is available through `Recover Cloudflare Deployment` on
+`main`, with the original deployment run ID and attempt. It checks the source
+run and contiguous live Cloudflare history before restoring the explicit prior
+version. Production traffic changes must use a protected workflow. Do not use bare
+`wrangler rollback`: it selects from mutable deployment history and can undo
+someone else's deployment. If recovery declines because production changed,
+inspect the active version and use a new reviewed workflow run to fix forward.
 
 #### Version Uploads (Gradual Rollouts)
 
@@ -173,6 +201,7 @@ For feature branches, GitHub Actions automatically uploads new versions without 
 4. Use Cloudflare dashboard to gradually roll out the version
 
 Manual version upload:
+
 ```bash
 pnpm cf:versions:upload
 ```
@@ -180,6 +209,7 @@ pnpm cf:versions:upload
 ### Creating Resources
 
 First-time setup:
+
 ```bash
 # Create KV namespace for OAuth token storage
 npx wrangler kv:namespace create OAUTH_KV
@@ -190,6 +220,7 @@ npx wrangler kv:namespace create OAUTH_KV
 ## Multi-Region Considerations
 
 Cloudflare Workers run globally, but consider:
+
 - KV is eventually consistent globally
 - Workers are stateless and edge-deployed
 - Use regional hints for performance
@@ -199,10 +230,7 @@ Cloudflare Workers run globally, but consider:
 ### CORS Settings
 
 ```typescript
-const ALLOWED_ORIGINS = [
-  "https://sentry.io",
-  "https://*.sentry.io"
-];
+const ALLOWED_ORIGINS = ["https://sentry.io", "https://*.sentry.io"];
 
 // Apply to responses
 response.headers.set("Access-Control-Allow-Origin", origin);
@@ -213,7 +241,7 @@ response.headers.set("Access-Control-Allow-Credentials", "true");
 
 ```typescript
 // Secure cookie settings
-"HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
+"HttpOnly; Secure; SameSite=Lax; Max-Age=2592000";
 ```
 
 ## Monitoring
@@ -239,6 +267,7 @@ export default {
 ### Worker Analytics
 
 Monitor via Cloudflare dashboard:
+
 - Request rates
 - Error rates
 - CPU time and memory usage
